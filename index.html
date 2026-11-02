@@ -589,10 +589,16 @@
       }
 
       saveBrandMappings() {
+        // Jangan serialisasi puluhan ribu mapping ke localStorage: itu menggandakan
+        // pemakaian memori dan dapat membuat tab Chrome kehabisan memori.
         try {
+          if ((this.brandMappings || []).length > 2000) {
+            localStorage.removeItem('suryatokoku_brand_mappings');
+            return;
+          }
           localStorage.setItem('suryatokoku_brand_mappings', JSON.stringify(this.brandMappings));
         } catch (e) {
-          console.error("Gagal menyimpan acuan merek:", e);
+          console.warn('Cache mapping merek lokal dilewati:', e);
         }
       }
 
@@ -624,40 +630,66 @@
         try {
           console.log('Mengambil data dari Supabase...');
           
+          // Supabase/PostgREST biasanya mengembalikan maksimal 1.000 baris per request.
+          // Ambil seluruh Master Merek dengan pagination agar 50.000+ baris tidak terpotong.
+          const fetchAllRows = async (tableName, pageSize = 1000) => {
+            const allRows = [];
+            let from = 0;
+            while (true) {
+              const to = from + pageSize - 1;
+              // Jangan memaksakan order('item_code') pada semua tabel:
+              // trans_pos dan beberapa tabel transaksi tidak memiliki kolom item_code.
+              const { data, error } = await supabase
+                .from(tableName)
+                .select('*')
+                .range(from, to);
+              if (error) throw new Error(`Gagal mengambil ${tableName}: ${error.message}`);
+              const page = data || [];
+              allRows.push(...page);
+              if (page.length < pageSize) break;
+              from += pageSize;
+            }
+            console.log(`Data ${tableName} dimuat: ${allRows.length.toLocaleString('id-ID')} baris`);
+            return allRows;
+          };
+
           const [
-            brandsRes, productsRes, poGroupsRes, stocksRes, posRes, 
+            brandRowsRaw, productsRes, poGroupsRes, stocksRes, posRes,
             poItemsRes, grRes, salesRes, returnsRes, newItemsRes
           ] = await Promise.all([
-            supabase.from('master_brands').select('*'),
-            supabase.from('master_products').select('*'),
-            supabase.from('master_po_groups').select('*'),
-            supabase.from('master_stocks').select('*'),
-            supabase.from('trans_pos').select('*'),
-            supabase.from('trans_po_items').select('*'),
-            supabase.from('trans_goods_receipts').select('*'),
-            supabase.from('trans_sales').select('*'),
-            supabase.from('trans_returns').select('*'),
-            supabase.from('trans_new_items').select('*')
+            fetchAllRows('master_brands'),
+            fetchAllRows('master_products'),
+            fetchAllRows('master_po_groups'),
+            fetchAllRows('master_stocks'),
+            fetchAllRows('trans_pos'),
+            fetchAllRows('trans_po_items'),
+            fetchAllRows('trans_goods_receipts'),
+            fetchAllRows('trans_sales'),
+            fetchAllRows('trans_returns'),
+            fetchAllRows('trans_new_items')
           ]);
 
           // Master Merek: satu baris per item_code sebagai acuan unik.
-          const brandRows = (brandsRes.data || []).map(b => ({
+          const brandRows = (brandRowsRaw || []).map(b => ({
             id: b.item_code, code: String(b.brand_name || '').trim().toLowerCase(),
             name: b.brand_name, status: 'ACTIVE', itemCode: b.item_code, productName: b.product_name
           }));
-          this.brandMappings = (brandsRes.data || []).map(b => ({
+          this.brandMappings = (brandRowsRaw || []).map(b => ({
             id: `BM-${String(b.item_code || '').trim().toUpperCase()}`,
             itemCode: String(b.item_code || '').trim().toUpperCase(),
             productName: b.product_name || '', brandName: b.brand_name || ''
           }));
-          this.saveBrandMappings();
+          // Data 50k+ tetap di memori repository untuk kebutuhan pemetaan, tetapi tidak
+          // disalin lagi ke localStorage. Tampilan tabel menggunakan pagination agar DOM ringan.
           this.brands = [...new Map(brandRows.filter(b => b.name).map(b => [b.name.toLowerCase(), {
             id: b.name.toLowerCase(), code: b.name.toLowerCase(), name: b.name, status: 'ACTIVE'
           }])).values()];
+          // Gunakan Map agar pencarian merek untuk setiap produk tidak memindai 50.000 baris berulang kali.
+          const brandByItemCode = new Map(this.brandMappings.map(m => [m.itemCode, m]));
 
           // Produk mengambil merek melalui item_code dari master_brands.
-          this.products = (productsRes.data || []).map(p => {
-            const mapping = this.brandMappings.find(m => m.itemCode === String(p.item_code || '').trim().toUpperCase());
+          this.products = (productsRes || []).map(p => {
+            const mapping = brandByItemCode.get(String(p.item_code || '').trim().toUpperCase());
             const brandName = mapping ? mapping.brandName : '';
             return {
               id: p.item_code, code: p.item_code, originalCode: p.original_code,
@@ -666,38 +698,40 @@
             };
           });
 
+          // Indeks produk sekali untuk mempercepat pemetaan tabel besar.
+          const productByCode = new Map(this.products.map(p => [String(p.code || '').trim(), p]));
           // Mapping Grup PO
-          this.poGroups = (poGroupsRes.data || []).map(g => {
-             const prod = this.products.find(p => p.code === g.item_code);
+          this.poGroups = (poGroupsRes || []).map(g => {
+             const prod = productByCode.get(String(g.item_code || '').trim());
              return {
                id: g.id, itemCode: g.item_code, groupName: g.group_name, productName: prod ? prod.name : '-'
              };
           });
 
           // Mapping Master Stok
-          this.masterStocks = (stocksRes.data || []).map(s => {
-             const prod = this.products.find(p => p.code === s.item_code);
+          this.masterStocks = (stocksRes || []).map(s => {
+             const prod = productByCode.get(String(s.item_code || '').trim());
              return {
-               id: s.item_code, itemCode: s.item_code, productName: prod ? prod.name : '-',
+               id: s.item_code, itemCode: s.item_code, productName: s.product_name || (prod ? prod.name : s.item_code),
                stokEcer: s.stok_ecer, stokGrosir: s.stok_grosir, stokGudang: s.stok_gudang
              };
           });
 
           // Mapping PO Header
-          this.purchaseOrders = (posRes.data || []).map(po => ({
-             id: po.po_number, poNumber: po.po_number, groupCode: po.group_name,
-             orderDate: po.order_date, status: po.status, closeReason: po.close_reason
+          this.purchaseOrders = (posRes || []).map(po => ({
+             id: `${po.po_number}\u0000${po.group_name || ''}`, poNumber: po.po_number, groupCode: po.group_name,
+             orderDate: po.order_date, status: po.status, closeReason: po.close_reason || po.keterangan || po.notes || po.note || po.description || po.close_note || po.alasan_tutup || ''
           }));
 
           // Mapping PO Items
-          this.poItems = (poItemsRes.data || []).map(poi => ({
-             id: poi.id, poNumber: poi.po_number, productCode: poi.item_code,
+          this.poItems = (poItemsRes || []).map(poi => ({
+             id: poi.id, poNumber: poi.po_number, groupCode: poi.group_name || '', productCode: poi.item_code,
              qtyOrder: poi.qty_order, unitPrice: Number(poi.unit_price)
           }));
 
           // Mapping Goods Receipts
-          this.goodsReceipts = (grRes.data || []).map(gr => {
-             const prod = this.products.find(p => p.code === gr.item_code);
+          this.goodsReceipts = (grRes || []).map(gr => {
+             const prod = productByCode.get(String(gr.item_code || '').trim());
              return {
                id: gr.id, receiptNumber: gr.id, receiptDate: gr.receipt_date, receiverName: gr.receiver_name,
                poNumber: gr.po_number, groupCode: gr.group_name, productCode: gr.item_code,
@@ -706,8 +740,8 @@
           });
 
           // Mapping Sales
-          this.sales = (salesRes.data || []).map(s => {
-             const prod = this.products.find(p => p.code === s.item_code);
+          this.sales = (salesRes || []).map(s => {
+             const prod = productByCode.get(String(s.item_code || '').trim());
              return {
                id: s.id, transactionNo: s.id, date: s.transaction_date, productCode: s.item_code,
                qtyCanvas: s.qty_canvas, qtyEcer: s.qty_ecer, qtyGrosir: s.qty_grosir, qtyMP: s.qty_mp,
@@ -716,7 +750,7 @@
           });
           
           this.salesRecords = this.sales.map(s => {
-             const prod = this.products.find(p => p.code === s.productCode);
+             const prod = productByCode.get(String(s.productCode || '').trim());
              return {
                id: s.id, date: s.date, itemCode: s.productCode, productName: prod ? prod.name : '-',
                qtyCanvas: s.qtyCanvas, qtyEcer: s.qtyEcer, qtyGrosir: s.qtyGrosir, qtyMP: s.qtyMP
@@ -724,8 +758,8 @@
           });
 
           // Mapping Returns
-          this.returns = (returnsRes.data || []).map(r => {
-             const prod = this.products.find(p => p.code === r.item_code);
+          this.returns = (returnsRes || []).map(r => {
+             const prod = productByCode.get(String(r.item_code || '').trim());
              return {
                id: r.id, returnNumber: r.id, returnDate: r.return_date, groupCode: r.group_name, brandKey: prod ? prod.brandKey : '-',
                itemCode: r.item_code, productName: prod ? prod.name : '-', qtyReturn: r.qty_return, returnValue: Number(r.return_value), status: r.status,
@@ -735,9 +769,9 @@
           this.supplierReturns = [...this.returns];
 
           // Mapping Data Barang Baru
-          this.dataBarangBaru = (newItemsRes.data || []).map(n => {
-             const prod = this.products.find(p => p.code === n.item_code);
-             const brand = prod ? this.brands.find(b => b.code === prod.brandKey) : null;
+          this.dataBarangBaru = (newItemsRes || []).map(n => {
+             const prod = productByCode.get(String(n.item_code || '').trim());
+             const brand = prod ? { name: prod.brandName } : null;
              return {
                id: n.id, tanggalBeli: n.purchase_date, itemCode: n.item_code, 
                productName: prod ? prod.name : '-', brandName: brand ? brand.name : '-', qtyAwal: n.qty_initial
@@ -749,7 +783,8 @@
           console.log('Sinkronisasi Supabase Selesai.');
         } catch (error) {
           console.error("Gagal inisialisasi Supabase:", error);
-          alert("Gagal terhubung ke database. Pastikan URL dan KEY Supabase sudah benar.");
+          const detail = error?.message || error?.details || String(error);
+          alert(`Gagal memuat data dari Supabase. Detail: ${detail}`);
         }
       }
 
@@ -799,6 +834,34 @@
         this.notify();
       }
 
+      // Hapus semua baris Master Merek secara bertahap agar request tidak terlalu besar.
+      async deleteAllBrands() {
+        const codes = Array.from(new Set((this.brandMappings || [])
+          .map(m => String(m.itemCode || '').trim().toUpperCase())
+          .filter(Boolean)));
+        if (!codes.length) return { deleted: 0 };
+
+        const BATCH_SIZE = 500;
+        let deleted = 0;
+        for (let offset = 0; offset < codes.length; offset += BATCH_SIZE) {
+          const batch = codes.slice(offset, offset + BATCH_SIZE);
+          const { error } = await supabase
+            .from('master_brands')
+            .delete()
+            .in('item_code', batch);
+          if (error) {
+            throw new Error(`Gagal menghapus batch ${Math.floor(offset / BATCH_SIZE) + 1}: ${error.message}. Sebagian data mungkin sudah terhapus.`);
+          }
+          deleted += batch.length;
+        }
+
+        this.brandMappings = [];
+        this.brands = [];
+        this.saveBrandMappings();
+        this.notify();
+        return { deleted };
+      }
+
       getBrandByItemCode(itemCode) {
         const clean = String(itemCode || '').trim().toUpperCase();
         const mapping = this.brandMappings.find(m => String(m.itemCode || '').trim().toUpperCase() === clean);
@@ -821,85 +884,91 @@
         this.notify();
       }
 
-      // Import Master Merek skala besar: batch upsert agar 50.000 baris tidak membuat 50.000 request.
+      // Import Master Merek skala besar: minimalkan salinan data dan hentikan retry masif jika RLS menolak.
       async bulkUpsertBrandMappings(rows, reportProgress = () => {}) {
-        const CHUNK_SIZE = 500;
+        const CHUNK_SIZE = 250;
         const errors = [];
         let success = 0;
-        let processed = 0;
+        let failedRows = 0;
         const all = Array.isArray(rows) ? rows : [];
         const total = all.length;
-        const localRows = [];
+        const deduped = new Map();
         for (let i = 0; i < all.length; i++) {
           const row = all[i];
-          const itemCode = String(row.itemCode || '').replace(/\\u00a0/g, ' ').trim().toUpperCase();
-          const productName = String(row.productName || '').replace(/\\u00a0/g, ' ').trim();
-          const brandName = String(row.brandName || '').replace(/\\u00a0/g, ' ').trim();
+          const itemCode = String(row.itemCode || '').replace(/\u00a0/g, ' ').trim().toUpperCase();
+          const productName = String(row.productName || '').replace(/\u00a0/g, ' ').trim();
+          const brandName = String(row.brandName || '').replace(/\u00a0/g, ' ').trim();
           if (!itemCode || !productName || !brandName) {
             errors.push(`Baris Excel ${row.excelRow || i + 2}: Kode Item, Nama Produk, atau Nama Merek kosong.`);
-            processed++;
+            failedRows++;
             continue;
           }
-          localRows.push({ item_code: itemCode, product_name: productName, brand_name: brandName, _excelRow: row.excelRow || i + 2 });
+          // Map menyimpan hanya satu baris per kode item; baris terakhir menang.
+          deduped.set(itemCode, { item_code: itemCode, product_name: productName, brand_name: brandName, _excelRow: row.excelRow || i + 2 });
         }
-
-        // Upsert dengan item_code unik dalam setiap batch; baris terakhir untuk kode duplikat yang dipakai.
-        const deduped = new Map();
-        localRows.forEach(r => deduped.set(r.item_code, r));
         const payload = Array.from(deduped.values());
-        const successfulRows = [];
         const totalChunks = Math.ceil(payload.length / CHUNK_SIZE);
+        const mappingMap = new Map((this.brandMappings || []).map(m => [String(m.itemCode || '').trim().toUpperCase(), m]));
+        const brandMap = new Map((this.brands || []).map(b => [String(b.name || '').trim().toLowerCase(), b]));
+        const productBrandMap = new Map();
 
         for (let offset = 0; offset < payload.length; offset += CHUNK_SIZE) {
           const chunk = payload.slice(offset, offset + CHUNK_SIZE);
-          const { error } = await supabase.from('master_brands').upsert(
-            chunk.map(({ item_code, product_name, brand_name }) => ({ item_code, product_name, brand_name })),
-            { onConflict: 'item_code' }
-          );
+          const dbRows = chunk.map(({ item_code, product_name, brand_name }) => ({ item_code, product_name, brand_name }));
+          const { error } = await supabase.from('master_brands').upsert(dbRows, { onConflict: 'item_code' });
           if (!error) {
             success += chunk.length;
-            successfulRows.push(...chunk);
-          } else {
-            // Hanya jika satu batch gagal, fallback per baris untuk mengidentifikasi baris yang bermasalah.
-            console.error('Batch import Master Merek gagal; mencoba baris satu per satu:', error);
             for (const row of chunk) {
-              const single = await supabase.from('master_brands').upsert(
-                [{ item_code: row.item_code, product_name: row.product_name, brand_name: row.brand_name }],
-                { onConflict: 'item_code' }
-              );
-              if (single.error) errors.push(`Baris Excel ${row._excelRow} (${row.item_code}): ${single.error.message}`);
-              else { success++; successfulRows.push(row); }
+              mappingMap.set(row.item_code, { id: `BM-${row.item_code}`, itemCode: row.item_code, productName: row.product_name, brandName: row.brand_name });
+              const key = row.brand_name.toLowerCase();
+              if (!brandMap.has(key)) brandMap.set(key, { id: key, code: key, name: row.brand_name, status: 'ACTIVE' });
+              productBrandMap.set(row.item_code, row.brand_name);
+            }
+          } else {
+            console.error('Batch import Master Merek gagal:', error);
+            const message = error.message || 'Kesalahan Supabase tidak diketahui';
+            const isPolicyOrAuthError = /row-level security|permission denied|not authorized|JWT|unauthorized|42501/i.test(message) || error.code === '42501';
+            if (isPolicyOrAuthError) {
+              // Jangan mencoba ribuan request satu per satu jika masalahnya izin database.
+              failedRows += chunk.length;
+              errors.push(`Batch ${Math.floor(offset / CHUNK_SIZE) + 1} (${chunk.length} baris gagal): ${message}. Periksa policy RLS tabel master_brands.`);
+            } else {
+              // Fallback per baris hanya untuk error non-izin agar baris bermasalah dapat ditemukan.
+              for (const row of chunk) {
+                const single = await supabase.from('master_brands').upsert(
+                  [{ item_code: row.item_code, product_name: row.product_name, brand_name: row.brand_name }],
+                  { onConflict: 'item_code' }
+                );
+                if (single.error) { failedRows++; errors.push(`Baris Excel ${row._excelRow} (${row.item_code}): ${single.error.message}`); }
+                else {
+                  success++;
+                  mappingMap.set(row.item_code, { id: `BM-${row.item_code}`, itemCode: row.item_code, productName: row.product_name, brandName: row.brand_name });
+                  const key = row.brand_name.toLowerCase();
+                  if (!brandMap.has(key)) brandMap.set(key, { id: key, code: key, name: row.brand_name, status: 'ACTIVE' });
+                  productBrandMap.set(row.item_code, row.brand_name);
+                }
+              }
             }
           }
-          processed = Math.min(total, processed + chunk.length);
           reportProgress(Math.round(((offset + chunk.length) / Math.max(payload.length, 1)) * 95),
             `Menyimpan batch ${Math.floor(offset / CHUNK_SIZE) + 1}/${totalChunks} · ${Math.min(offset + chunk.length, payload.length).toLocaleString('id-ID')}/${payload.length.toLocaleString('id-ID')} baris`);
+          // Beri browser kesempatan menggambar progres dan memproses input.
+          await new Promise(resolve => setTimeout(resolve, 0));
         }
 
-        // Update cache lokal sekali saja (hindari localStorage + React render pada setiap baris).
-        if (successfulRows.length) {
-          const mappingMap = new Map((this.brandMappings || []).map(m => [String(m.itemCode || '').trim().toUpperCase(), m]));
-          const brandMap = new Map((this.brands || []).map(b => [String(b.name || '').trim().toLowerCase(), b]));
-          const productBrandMap = new Map();
-          successfulRows.forEach(r => {
-            mappingMap.set(r.item_code, { id: `BM-${r.item_code}`, itemCode: r.item_code, productName: r.product_name, brandName: r.brand_name });
-            const key = r.brand_name.toLowerCase();
-            if (!brandMap.has(key)) brandMap.set(key, { id: key, code: key, name: r.brand_name, status: 'ACTIVE' });
-            productBrandMap.set(r.item_code, r.brand_name);
-          });
+        if (success > 0) {
           this.brandMappings = Array.from(mappingMap.values());
           this.brands = Array.from(brandMap.values());
-          const productMap = new Map(productBrandMap);
           this.products = this.products.map(p => {
             const code = String(p.code || '').trim().toUpperCase();
-            const brandName = productMap.get(code);
+            const brandName = productBrandMap.get(code);
             return brandName ? { ...p, brandName, brandKey: brandName.toLowerCase() } : p;
           });
           this.saveBrandMappings();
           this.notify();
         }
-        reportProgress(100, `Selesai: ${success.toLocaleString('id-ID')} berhasil, ${errors.length.toLocaleString('id-ID')} gagal.`);
-        return { success, failed: errors.length, errors, total, uniqueCodes: payload.length };
+        reportProgress(100, `Selesai: ${success.toLocaleString('id-ID')} berhasil, ${failedRows.toLocaleString('id-ID')} gagal.`);
+        return { success, failed: failedRows, errors: errors.slice(0, 100), total, uniqueCodes: payload.length };
       }
 
       async deleteBrandMappings(itemCodes) { await this.deleteBrands(itemCodes); }
@@ -928,6 +997,99 @@
         }
         this.notify();
       }
+      // Import Master Produk dalam batch agar tidak mengirim satu request untuk setiap baris.
+      async bulkUpsertProducts(rows, reportProgress = () => {}) {
+        const CHUNK_SIZE = 250;
+        const errors = [];
+        let success = 0;
+        let failed = 0;
+        const deduped = new Map();
+        const input = Array.isArray(rows) ? rows : [];
+
+        for (let i = 0; i < input.length; i++) {
+          const row = input[i] || {};
+          const code = String(row.code || '').replace(/\u00a0/g, ' ').trim().toUpperCase();
+          const name = String(row.name || '').replace(/\u00a0/g, ' ').trim();
+          const originalCode = String(row.originalCode || '').replace(/\u00a0/g, ' ').trim().toUpperCase();
+          const priceRaw = row.basePrice;
+          const basePrice = priceRaw === '' || priceRaw == null ? 0 : Number(String(priceRaw).replace(/,/g, ''));
+          if (!code || !name) {
+            failed++;
+            errors.push(`Baris Excel ${row.excelRow || i + 2}: Kode Item dan Nama Produk wajib diisi.`);
+            continue;
+          }
+          if (!Number.isFinite(basePrice) || basePrice < 0) {
+            failed++;
+            errors.push(`Baris Excel ${row.excelRow || i + 2} (${code}): Harga Beli tidak valid.`);
+            continue;
+          }
+          // Kode item duplikat digabung; data terakhir yang dipakai.
+          deduped.set(code, { code, name, originalCode, basePrice, excelRow: row.excelRow || i + 2 });
+        }
+
+        const payload = Array.from(deduped.values());
+        const totalChunks = Math.ceil(payload.length / CHUNK_SIZE);
+        const productMap = new Map((this.products || []).map(p => [String(p.code || '').trim().toUpperCase(), p]));
+        const brandMappingMap = new Map((this.brandMappings || []).map(m => [String(m.itemCode || '').trim().toUpperCase(), m]));
+
+        for (let offset = 0; offset < payload.length; offset += CHUNK_SIZE) {
+          const chunk = payload.slice(offset, offset + CHUNK_SIZE);
+          const dbRows = chunk.map(item => ({
+            item_code: item.code,
+            original_code: item.originalCode || null,
+            product_name: item.name,
+            base_price: item.basePrice,
+            status: 'ACTIVE'
+          }));
+          const { error } = await supabase.from('master_products').upsert(dbRows, { onConflict: 'item_code' });
+
+          if (error) {
+            failed += chunk.length;
+            errors.push(`Batch ${Math.floor(offset / CHUNK_SIZE) + 1} (${chunk.length} baris) gagal: ${error.message}`);
+          } else {
+            success += chunk.length;
+            const brandRowsToSync = [];
+            for (const item of chunk) {
+              const existing = productMap.get(item.code) || {};
+              const mapping = brandMappingMap.get(item.code);
+              const brandName = mapping ? String(mapping.brandName || '').trim() : String(existing.brandName || '').trim();
+              const product = {
+                ...existing,
+                id: item.code,
+                code: item.code,
+                originalCode: item.originalCode,
+                name: item.name,
+                basePrice: item.basePrice,
+                status: 'ACTIVE',
+                brandName,
+                brandKey: brandName.toLowerCase()
+              };
+              productMap.set(item.code, product);
+              if (mapping && mapping.brandName) {
+                brandRowsToSync.push({ item_code: item.code, product_name: item.name, brand_name: mapping.brandName });
+                brandMappingMap.set(item.code, { ...mapping, productName: item.name });
+              }
+            }
+            // Update nama produk di Master Merek hanya jika item sudah memiliki mapping merek.
+            if (brandRowsToSync.length) {
+              const { error: brandError } = await supabase.from('master_brands').upsert(brandRowsToSync, { onConflict: 'item_code' });
+              if (brandError) errors.push(`Produk tersimpan, tetapi sinkronisasi nama ke Master Merek gagal pada batch ${Math.floor(offset / CHUNK_SIZE) + 1}: ${brandError.message}`);
+            }
+          }
+
+          reportProgress(Math.round(((offset + chunk.length) / Math.max(payload.length, 1)) * 95),
+            `Menyimpan batch ${Math.floor(offset / CHUNK_SIZE) + 1}/${Math.max(totalChunks, 1)} · ${Math.min(offset + chunk.length, payload.length).toLocaleString('id-ID')}/${payload.length.toLocaleString('id-ID')} produk`);
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+
+        this.products = Array.from(productMap.values());
+        this.brandMappings = Array.from(brandMappingMap.values());
+        this.saveBrandMappings();
+        this.notify();
+        reportProgress(100, `Selesai: ${success.toLocaleString('id-ID')} berhasil, ${failed.toLocaleString('id-ID')} gagal.`);
+        return { success, failed, errors: errors.slice(0, 100), total: input.length, uniqueCodes: payload.length };
+      }
+
       async updateProduct(code, updated) {
         const { error } = await supabase.from('master_products').update({
            original_code: updated.originalCode, product_name: updated.name, base_price: updated.basePrice
@@ -1016,43 +1178,125 @@
       }
 
       async addSalesRecord(item) {
-        const itemCode = String(item.itemCode || '').trim().toUpperCase();
-        if (!itemCode) throw new Error('Kode Item wajib diisi.');
-        if (!this.products.some(p => String(p.code || '').trim().toUpperCase() === itemCode)) throw new Error(`Kode Item ${itemCode} belum ada di Master Produk.`);
-        const { data, error } = await supabase.from('trans_sales').insert([{
-          transaction_date: item.date || null, item_code: itemCode,
-          qty_canvas: Number(item.qtyCanvas) || 0, qty_ecer: Number(item.qtyEcer) || 0,
-          qty_grosir: Number(item.qtyGrosir) || 0, qty_mp: Number(item.qtyMP) || 0
-        }]).select();
+        const result = await this.addSalesRecordsBatch([item]);
+        if (result.failed) throw new Error(result.errors[0]?.message || 'Gagal menyimpan transaksi penjualan.');
+      }
+
+      // Simpan transaksi penjualan per batch ke Supabase, lalu sinkronkan cache hanya untuk baris yang berhasil.
+      async addSalesRecordsBatch(items) {
+        const rows = Array.isArray(items) ? items : [];
+        if (!rows.length) return { success: 0, failed: 0, errors: [] };
+        const payload = rows.map((item, index) => {
+          const itemCode = String(item.itemCode || '').trim().toUpperCase();
+          if (!itemCode) throw new Error(`Baris batch ${index + 1}: Kode Item wajib diisi.`);
+          if (!this.products.some(p => String(p.code || '').trim().toUpperCase() === itemCode)) throw new Error(`Baris batch ${index + 1}: Kode Item ${itemCode} belum ada di Master Produk.`);
+          return { transaction_date: item.date || null, item_code: itemCode,
+            qty_canvas: Number(item.qtyCanvas) || 0, qty_ecer: Number(item.qtyEcer) || 0,
+            qty_grosir: Number(item.qtyGrosir) || 0, qty_mp: Number(item.qtyMP) || 0 };
+        });
+        const { data, error } = await supabase.from('trans_sales').insert(payload).select();
         if (error) throw new Error(error.message);
-        const saved = data[0];
-        const prod = this.products.find(p => p.code === itemCode);
-        const record = { id: saved.id, date: saved.transaction_date, productCode: itemCode, itemCode, productName: prod ? prod.name : (item.productName || '-'), qtyCanvas: Number(saved.qty_canvas) || 0, qtyEcer: Number(saved.qty_ecer) || 0, qtyGrosir: Number(saved.qty_grosir) || 0, qtyMP: Number(saved.qty_mp) || 0 };
-        record.qty = record.qtyCanvas + record.qtyEcer + record.qtyGrosir + record.qtyMP;
-        this.sales.push(record); this.salesRecords.push(record); this.notify();
+        const productByCode = new Map(this.products.map(p => [String(p.code || '').trim().toUpperCase(), p]));
+        const savedRows = (data || []).map(saved => {
+          const code = String(saved.item_code || '').trim().toUpperCase();
+          const prod = productByCode.get(code);
+          const record = { id: saved.id, date: saved.transaction_date, productCode: code, itemCode: code,
+            productName: prod ? prod.name : '-', qtyCanvas: Number(saved.qty_canvas) || 0,
+            qtyEcer: Number(saved.qty_ecer) || 0, qtyGrosir: Number(saved.qty_grosir) || 0, qtyMP: Number(saved.qty_mp) || 0 };
+          record.qty = record.qtyCanvas + record.qtyEcer + record.qtyGrosir + record.qtyMP;
+          return record;
+        });
+        this.sales.push(...savedRows.map(r => ({ ...r, productCode: r.itemCode })));
+        this.salesRecords.push(...savedRows);
+        this.notify();
+        return { success: savedRows.length, failed: Math.max(0, rows.length - savedRows.length), errors: [] };
       }
       async deletePOGroups(ids) {
-        await supabase.from('master_po_groups').delete().in('id', ids);
-        this.poGroups = this.poGroups.filter(g => !ids.includes(g.id));
+        if (!ids || !ids.length) return;
+        const { error } = await supabase.from('master_po_groups').delete().in('id', ids);
+        if (error) throw new Error(error.message);
+        this.poGroups = this.poGroups.filter(g => !ids.some(id => String(id) === String(g.id)));
         this.notify();
       }
 
       // --- MASTER STOCKS ---
       getMasterStocks() { return [...this.masterStocks]; }
       async upsertMasterStock({ itemCode, productName, stokEcer, stokGrosir, stokGudang }) {
-        const { error } = await supabase.from('master_stocks').upsert({
-           item_code: itemCode, stok_ecer: stokEcer, stok_grosir: stokGrosir, stok_gudang: stokGudang, updated_at: new Date().toISOString()
-        }, { onConflict: 'item_code' });
-        if (error) throw new Error(error.message);
-        const idx = this.masterStocks.findIndex(s => s.itemCode === itemCode);
-        const newData = { id: itemCode, itemCode, productName, stokEcer, stokGrosir, stokGudang };
-        if(idx >= 0) this.masterStocks[idx] = newData; else this.masterStocks.push(newData);
+        const result = await this.upsertMasterStocksBatch([{ itemCode, productName, stokEcer, stokGrosir, stokGudang }]);
+        if (result.failed) throw new Error(result.errors[0]?.message || 'Gagal menyimpan stok.');
+      }
+
+      // Import batch: tidak memerlukan keberadaan kode di master_products.
+      // Data diproses per batch dan fallback per baris hanya jika satu batch ditolak,
+      // agar data valid tetap tersimpan dan kesalahan tidak disembunyikan.
+      async upsertMasterStocksBatch(items, reportProgress = () => {}) {
+        const normalizedMap = new Map();
+        for (const item of items) {
+          const code = String(item.itemCode ?? '').trim().toUpperCase();
+          if (!code) continue;
+          const nonNegative = value => Math.max(0, Number(value) || 0);
+          normalizedMap.set(code, {
+            item_code: code,
+            product_name: String(item.productName || '').trim() || code,
+            stok_ecer: nonNegative(item.stokEcer),
+            stok_grosir: nonNegative(item.stokGrosir),
+            stok_gudang: nonNegative(item.stokGudang),
+            updated_at: new Date().toISOString()
+          });
+        }
+        const payload = Array.from(normalizedMap.values());
+        const CHUNK_SIZE = 500;
+        let success = 0;
+        const errors = [];
+        const localByCode = new Map(this.masterStocks.map(s => [String(s.itemCode || '').trim().toUpperCase(), s]));
+        const sourceByCode = new Map();
+        for (const item of items) {
+          const code = String(item.itemCode ?? '').trim().toUpperCase();
+          if (code) sourceByCode.set(code, item);
+        }
+        for (let offset = 0; offset < payload.length; offset += CHUNK_SIZE) {
+          const chunk = payload.slice(offset, offset + CHUNK_SIZE);
+          const { error } = await supabase.from('master_stocks').upsert(chunk, { onConflict: 'item_code' });
+          if (!error) {
+            success += chunk.length;
+            chunk.forEach(row => {
+              const src = sourceByCode.get(row.item_code) || {};
+              localByCode.set(row.item_code, { id: row.item_code, itemCode: row.item_code, productName: String(src.productName || '').trim() || this.products.find(p => String(p.code || '').trim().toUpperCase() === row.item_code)?.name || row.product_name || row.item_code, stokEcer: row.stok_ecer, stokGrosir: row.stok_grosir, stokGudang: row.stok_gudang });
+            });
+          } else {
+            // Batch gagal: coba satu per satu supaya baris yang masih valid tetap tersimpan.
+            for (const row of chunk) {
+              const { error: rowError } = await supabase.from('master_stocks').upsert(row, { onConflict: 'item_code' });
+              if (rowError) { errors.push({ itemCode: row.item_code, message: rowError.message }); continue; }
+              success++;
+              const src = sourceByCode.get(row.item_code) || {};
+              localByCode.set(row.item_code, { id: row.item_code, itemCode: row.item_code, productName: String(src.productName || '').trim() || this.products.find(p => String(p.code || '').trim().toUpperCase() === row.item_code)?.name || row.product_name || row.item_code, stokEcer: row.stok_ecer, stokGrosir: row.stok_grosir, stokGudang: row.stok_gudang });
+            }
+          }
+          reportProgress(Math.round(Math.min(offset + chunk.length, payload.length) / Math.max(payload.length, 1) * 100), `Menyimpan batch ${Math.floor(offset / CHUNK_SIZE) + 1}/${Math.max(1, Math.ceil(payload.length / CHUNK_SIZE))} · ${Math.min(offset + chunk.length, payload.length).toLocaleString('id-ID')}/${payload.length.toLocaleString('id-ID')} kode`);
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        this.masterStocks = Array.from(localByCode.values());
         this.notify();
+        return { success, failed: errors.length, errors, total: items.length, uniqueCodes: payload.length };
       }
       async deleteMasterStocks(ids) {
-        await supabase.from('master_stocks').delete().in('item_code', ids);
-        this.masterStocks = this.masterStocks.filter(s => !ids.includes(s.itemCode));
+        const codes = [...new Set((ids || []).map(id => String(id ?? '').trim().toUpperCase()).filter(Boolean))];
+        if (!codes.length) return { deleted: 0 };
+        // Periksa error Supabase: jangan pernah menghapus cache lokal jika server menolak.
+        let deleted = 0;
+        const CHUNK_SIZE = 300;
+        for (let offset = 0; offset < codes.length; offset += CHUNK_SIZE) {
+          const chunk = codes.slice(offset, offset + CHUNK_SIZE);
+          const { count, error } = await supabase.from('master_stocks')
+            .delete({ count: 'exact' }).in('item_code', chunk);
+          if (error) throw new Error(`Supabase gagal menghapus stok: ${error.message}`);
+          deleted += Number(count) || 0;
+        }
+        const deletedSet = new Set(codes);
+        this.masterStocks = this.masterStocks.filter(s => !deletedSet.has(String(s.itemCode ?? '').trim().toUpperCase()));
         this.notify();
+        return { deleted };
       }
 
       // --- PO ---
@@ -1065,39 +1309,110 @@
         if (poErr) throw new Error(poErr.message);
 
         const insertItems = items.map(it => ({
-           po_number: po.poNumber, item_code: it.productCode, qty_order: it.qtyOrder, unit_price: it.unitPrice
+           po_number: po.poNumber, group_name: po.groupCode, item_code: it.productCode, qty_order: it.qtyOrder, unit_price: it.unitPrice
         }));
         const { data: inserted, error: itemsErr } = await supabase.from('trans_po_items').insert(insertItems).select();
         if (itemsErr) throw new Error(itemsErr.message);
 
-        this.purchaseOrders.push({ ...po, id: po.poNumber });
+        this.purchaseOrders.push({ ...po, id: `${po.poNumber}\u0000${po.groupCode || ''}` });
         inserted.forEach(i => {
-           this.poItems.push({ id: i.id, poNumber: i.po_number, productCode: i.item_code, qtyOrder: i.qty_order, unitPrice: i.unit_price });
+           this.poItems.push({ id: i.id, poNumber: i.po_number, groupCode: i.group_name || po.groupCode, productCode: i.item_code, qtyOrder: i.qty_order, unitPrice: i.unit_price });
         });
         this.notify();
       }
       async deletePOItems(itemIds) {
-        await supabase.from('trans_po_items').delete().in('id', itemIds);
+        if (!itemIds || !itemIds.length) return;
+        const batchSize = 500;
+        for (let i = 0; i < itemIds.length; i += batchSize) {
+          const batch = itemIds.slice(i, i + batchSize);
+          const { error } = await supabase.from('trans_po_items').delete().in('id', batch);
+          if (error) throw new Error(`Gagal menghapus detail PO: ${error.message}`);
+        }
         this.poItems = this.poItems.filter(item => !itemIds.includes(item.id));
         this.notify();
+      }
+      async deleteAllPOData(onProgress) {
+        // Hapus detail terlebih dahulu untuk menjaga relasi foreign key.
+        const itemIds = this.poItems.map(item => item.id).filter(id => id !== null && id !== undefined);
+        const poNumbers = [...new Set(this.purchaseOrders.map(po => po.poNumber).filter(Boolean))];
+        const batchSize = 500;
+        let deletedItems = 0;
+        for (let i = 0; i < itemIds.length; i += batchSize) {
+          const batch = itemIds.slice(i, i + batchSize);
+          const { error } = await supabase.from('trans_po_items').delete().in('id', batch);
+          if (error) throw new Error(`Gagal menghapus detail PO: ${error.message}`);
+          deletedItems += batch.length;
+          if (onProgress) onProgress({ stage: 'detail', done: deletedItems, total: itemIds.length });
+        }
+        // Hapus header berdasarkan nomor PO setelah semua detail terhapus.
+        let deletedHeaders = 0;
+        for (let i = 0; i < poNumbers.length; i += batchSize) {
+          const batch = poNumbers.slice(i, i + batchSize);
+          const { error } = await supabase.from('trans_pos').delete().in('po_number', batch);
+          if (error) throw new Error(`Gagal menghapus header PO: ${error.message}`);
+          deletedHeaders += batch.length;
+          if (onProgress) onProgress({ stage: 'header', done: deletedHeaders, total: poNumbers.length });
+        }
+        this.poItems = [];
+        this.purchaseOrders = [];
+        this.notify();
+        return { deletedItems, deletedHeaders };
       }
 
       // --- GOODS RECEIPTS ---
       getGoodsReceipts() { return [...this.goodsReceipts]; }
       async deleteGoodsReceipts(ids) {
-        await supabase.from('trans_goods_receipts').delete().in('id', ids);
+        const { error } = await supabase.from('trans_goods_receipts').delete().in('id', ids);
+        if (error) throw new Error(error.message);
         this.goodsReceipts = this.goodsReceipts.filter(r => !ids.includes(r.id));
+        this.notify();
+      }
+      async deleteAllGoodsReceipts() {
+        const { error, count } = await supabase.from('trans_goods_receipts').delete({ count: 'exact' }).not('id', 'is', null);
+        if (error) throw new Error(error.message);
+        this.goodsReceipts = [];
+        this.notify();
+        return count;
+      }
+      async addGoodsReceiptsBatch(items) {
+        if (!items.length) return;
+        const payload = items.map(item => ({
+          receipt_date: item.receiptDate || null, receiver_name: item.receiverName || null,
+          po_number: item.poNumber || null, group_name: item.groupCode || null,
+          item_code: String(item.productCode || '').trim().toUpperCase(), barcode: item.noBarcode || null,
+          qty_received: Number(item.qtyReceived) || 0
+        }));
+        const { data, error } = await supabase.from('trans_goods_receipts').insert(payload).select();
+        if (error) throw new Error(error.message);
+        data.forEach((saved, i) => {
+          const item = items[i]; const prod = this.products.find(p => p.code === payload[i].item_code);
+          this.goodsReceipts.push({ ...item, id: saved.id, receiptNumber: saved.id, productCode: payload[i].item_code,
+            productName: prod ? prod.name : (item.productName || '-'), qtyReceived: payload[i].qty_received, qtyOrder: Number(item.qtyOrder) || 0 });
+        });
         this.notify();
       }
 
       // --- SALES ---
       getSales() { return [...this.sales]; }
       getSalesRecords() { return [...this.salesRecords]; }
-      async deleteSalesRecords(ids) {
-        await supabase.from('trans_sales').delete().in('id', ids);
-        this.sales = this.sales.filter(s => !ids.includes(s.id));
-        this.salesRecords = this.salesRecords.filter(s => !ids.includes(s.id));
-        this.notify();
+      async deleteSalesRecords(ids, reportProgress = () => {}) {
+        const uniqueIds = [...new Set((ids || []).filter(id => id !== null && id !== undefined && String(id) !== ''))];
+        if (!uniqueIds.length) return { deleted: 0 };
+        const CHUNK_SIZE = 300;
+        let deleted = 0;
+        for (let offset = 0; offset < uniqueIds.length; offset += CHUNK_SIZE) {
+          const batch = uniqueIds.slice(offset, offset + CHUNK_SIZE);
+          const { data, error } = await supabase.from('trans_sales').delete().in('id', batch).select('id');
+          if (error) throw new Error(`Gagal menghapus batch ${Math.floor(offset / CHUNK_SIZE) + 1}: ${error.message}`);
+          const deletedIds = (data || []).map(row => row.id);
+          deleted += deletedIds.length;
+          const removed = new Set(deletedIds.map(String));
+          this.sales = this.sales.filter(row => !removed.has(String(row.id)));
+          this.salesRecords = this.salesRecords.filter(row => !removed.has(String(row.id)));
+          reportProgress?.(Math.round(Math.min(offset + batch.length, uniqueIds.length) / uniqueIds.length * 100), `Menghapus ${Math.min(offset + batch.length, uniqueIds.length).toLocaleString('id-ID')} dari ${uniqueIds.length.toLocaleString('id-ID')} data...`);
+          this.notify();
+        }
+        return { deleted };
       }
 
       // --- RETURNS ---
@@ -1390,21 +1705,42 @@
       const products = mockRepo.getProducts();
       const pos = mockRepo.getPOs();
       const poItems = mockRepo.getPOItems();
+      const masterStocks = mockRepo.getMasterStocks();
       const receipts = mockRepo.getGoodsReceipts();
       const sales = mockRepo.getSales();
       const returns = mockRepo.getReturns();
       const returnRealizations = mockRepo.getReturnRealizations();
 
-      // Perhitungan Stok Total & Nilai Stok
+      // Master Stok menjadi sumber stok aktual yang konsisten untuk dashboard dan laporan per merek.
+      // Index berdasarkan kode item agar lookup cepat dan tidak memindai seluruh stok untuk setiap SKU.
+      const stockByCode = new Map(masterStocks.map(s => [String(s.itemCode || '').trim().toUpperCase(), s]));
       let totalStockPcs = 0;
       let totalStockValue = 0;
+      const brandSummaryMap = new Map();
+      brands.forEach(b => brandSummaryMap.set(b.code, {
+        code: b.code, name: b.name, skuCount: 0, stock: 0, value: 0
+      }));
 
       products.forEach(p => {
-        const ledger = mockRepo.calculateStockLedger(p.code);
-        totalStockPcs += ledger.currentStock;
-        const valUnit = getProductUnitValuation(p, poItems);
-        totalStockValue += ledger.currentStock * valUnit;
+        const stockRow = stockByCode.get(String(p.code || '').trim().toUpperCase());
+        const stock = stockRow ? (Number(stockRow.stokEcer) || 0) + (Number(stockRow.stokGrosir) || 0) + (Number(stockRow.stokGudang) || 0) : 0;
+        const valUnit = Number(getProductUnitValuation(p, poItems)) || 0;
+        const value = stock * valUnit;
+        totalStockPcs += stock;
+        totalStockValue += value;
+
+        const brand = brandSummaryMap.get(p.brandKey);
+        if (brand) {
+          brand.skuCount += 1;
+          brand.stock += stock;
+          brand.value += value;
+        }
       });
+
+      // Dashboard hanya menampilkan 10 merek dengan nilai stok tertinggi.
+      const topBrandSummaries = Array.from(brandSummaryMap.values())
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 10);
 
       // PO & Realisasi PO
       const totalPONominal = poItems.reduce((acc, it) => acc + (Number(it.qtyOrder) * Number(it.unitPrice)), 0);
@@ -1431,13 +1767,12 @@
             <div className="soft-card p-6 lg:col-span-2">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="font-bold text-slate-800 text-base">Stok & Valuasi per Merek</h3>
-                <span className="text-xs text-slate-400 font-medium">Rekapitulasi Otomatis</span>
+                <span className="text-xs text-slate-400 font-medium">10 Merek dengan Nilai Tertinggi</span>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-sm">
                   <thead>
                     <tr className="border-b border-slate-100 text-xs font-semibold text-slate-400 uppercase">
-                      <th className="pb-3">Kode Merek</th>
                       <th className="pb-3">Nama Merek</th>
                       <th className="pb-3 text-right">SKU Aktif</th>
                       <th className="pb-3 text-right">Total Stok (Pcs)</th>
@@ -1445,25 +1780,17 @@
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {brands.map(b => {
-                      const brandProds = products.filter(p => p.brandKey === b.code);
-                      let bStock = 0;
-                      let bVal = 0;
-                      brandProds.forEach(bp => {
-                        const ld = mockRepo.calculateStockLedger(bp.code);
-                        bStock += ld.currentStock;
-                        bVal += ld.currentStock * getProductUnitValuation(bp, poItems);
-                      });
-                      return (
-                        <tr key={b.code} className="hover:bg-slate-50/70 transition">
-                          <td className="py-3 font-semibold text-slate-700">{b.code}</td>
-                          <td className="py-3 text-slate-600">{b.name}</td>
-                          <td className="py-3 text-right font-medium text-slate-600">{brandProds.length}</td>
-                          <td className="py-3 text-right font-bold text-slate-800">{formatNum(bStock)}</td>
-                          <td className="py-3 text-right font-medium text-blue-600">{formatRp(bVal)}</td>
-                        </tr>
-                      );
-                    })}
+                    {topBrandSummaries.map(b => (
+                      <tr key={b.code} className="hover:bg-slate-50/70">
+                        <td className="py-3 text-slate-600">{b.name}</td>
+                        <td className="py-3 text-right font-medium text-slate-600">{b.skuCount}</td>
+                        <td className="py-3 text-right font-bold text-slate-800">{formatNum(b.stock)}</td>
+                        <td className="py-3 text-right font-medium text-blue-600">{formatRp(b.value)}</td>
+                      </tr>
+                    ))}
+                    {topBrandSummaries.length === 0 && (
+                      <tr><td colSpan="4" className="py-6 text-center text-slate-400">Belum ada data merek.</td></tr>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -1530,6 +1857,8 @@
       useEffect(() => mockRepo.subscribe(() => setRepoState(prev => prev + 1)), []);
       
       const [search, setSearch] = useState('');
+      const [currentPage, setCurrentPage] = useState(1);
+      const PAGE_SIZE = 100;
       const [selectedCodes, setSelectedCodes] = useState([]);
       const [showModal, setShowModal] = useState(false);
       const [editItem, setEditItem] = useState(null);
@@ -1537,6 +1866,8 @@
       const [importModal, setImportModal] = useState(false);
       const [feedbackMessage, setFeedbackMessage] = useState(null);
       const [confirmDeleteModal, setConfirmDeleteModal] = useState({ isOpen: false, codes: [], title: '', message: '' });
+      const [confirmDeleteAllOpen, setConfirmDeleteAllOpen] = useState(false);
+      const [deletingAll, setDeletingAll] = useState(false);
 
       const brands = mockRepo.getBrands();
       const brandMappings = mockRepo.getBrandMappings();
@@ -1555,11 +1886,19 @@
         .sort((a, b) => (a.productName || '').localeCompare(b.productName || '', 'id', { sensitivity: 'base' })),
         [brandMappings, repoState]);
 
-      const filtered = itemsList.filter(item => {
-        return item.brandName.toLowerCase().includes(search.toLowerCase()) || 
-               item.itemCode.toLowerCase().includes(search.toLowerCase()) ||
-               item.productName.toLowerCase().includes(search.toLowerCase());
-      });
+      const filtered = useMemo(() => {
+        const q = search.trim().toLowerCase();
+        if (!q) return itemsList;
+        return itemsList.filter(item =>
+          item.brandName.toLowerCase().includes(q) ||
+          item.itemCode.toLowerCase().includes(q) ||
+          item.productName.toLowerCase().includes(q)
+        );
+      }, [itemsList, search]);
+      const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+      const safePage = Math.min(currentPage, totalPages);
+      const pageItems = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+      useEffect(() => { setCurrentPage(1); }, [search]);
 
       const showToast = (message, type = 'success') => {
         setFeedbackMessage({ message, type });
@@ -1606,6 +1945,25 @@
           showToast(`Gagal menghapus: ${error.message}`, 'error');
         }
         setConfirmDeleteModal({ isOpen: false, codes: [], title: '', message: '' });
+      };
+
+      const executeDeleteAll = async () => {
+        if (deletingAll) return;
+        setDeletingAll(true);
+        try {
+          const result = await mockRepo.deleteAllBrands();
+          setSelectedCodes([]);
+          setCurrentPage(1);
+          setSearch('');
+          showToast(result.deleted
+            ? `Berhasil menghapus ${result.deleted.toLocaleString('id-ID')} data Master Merek.`
+            : 'Tidak ada data Master Merek yang perlu dihapus.', 'success');
+          setConfirmDeleteAllOpen(false);
+        } catch (error) {
+          showToast(`Penghapusan semua data gagal: ${error.message}`, 'error');
+        } finally {
+          setDeletingAll(false);
+        }
       };
 
       const handleSave = async (e) => {
@@ -1678,6 +2036,9 @@
                 <button onClick={() => setImportModal(true)} className="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-xs font-semibold rounded-xl flex items-center gap-1.5 transition">
                   <i data-lucide="upload" className="w-3.5 h-3.5"></i> Import Excel
                 </button>
+                <button onClick={() => setConfirmDeleteAllOpen(true)} className="px-3 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-semibold rounded-xl flex items-center gap-1.5 transition" title="Hapus seluruh data Master Merek tanpa memilih checkbox">
+                  <i data-lucide="trash-2" className="w-3.5 h-3.5"></i> Hapus Semua Data
+                </button>
                 <button onClick={handleExport} className={`px-3 py-2 text-xs font-semibold rounded-xl flex items-center gap-1.5 transition ${selectedCodes.length > 0 ? 'bg-slate-800 hover:bg-slate-900 text-white shadow-sm' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`} title={selectedCodes.length === 0 ? 'Pilih minimal satu data untuk diexport' : 'Export data terpilih'}>
                   <i data-lucide="file-spreadsheet" className="w-3.5 h-3.5"></i> Export Excel {selectedCodes.length > 0 ? `(${selectedCodes.length})` : ''}
                 </button>
@@ -1702,17 +2063,17 @@
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filtered.length === 0 ? (
+                  {pageItems.length === 0 ? (
                     <tr><td colSpan="6" className="text-center py-6 text-slate-400">Tidak ada data merek ditemukan</td></tr>
                   ) : (
-                    filtered.map((item, idx) => {
+                    pageItems.map((item, idx) => {
                       const isSelected = selectedCodes.includes(item.itemCode);
                       return (
                         <tr key={item.id || item.itemCode} className={`transition ${isSelected ? 'bg-blue-50/60' : 'hover:bg-slate-50/70'}`}>
                           <td className="py-3 px-4 text-center">
                             <input type="checkbox" checked={isSelected} onChange={() => handleToggleSelect(item.itemCode)} className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer" />
                           </td>
-                          <td className="py-3 px-4 text-center font-bold text-slate-400">{idx + 1}</td>
+                          <td className="py-3 px-4 text-center font-bold text-slate-400">{(safePage - 1) * PAGE_SIZE + idx + 1}</td>
                           <td className="py-3 px-4 font-mono text-xs font-semibold text-slate-700">{item.itemCode}</td>
                           <td className="py-3 px-4 text-slate-700 font-medium text-xs">{item.productName}</td>
                           <td className="py-3 px-4 font-bold text-blue-600">{item.brandName}</td>
@@ -1736,9 +2097,16 @@
               </table>
             </div>
 
-            <div className="flex justify-between items-center text-xs text-slate-400 mt-4 px-1">
-              <span>Menampilkan {filtered.length} dari total {itemsList.length} data produk/merek (Nama Produk A-Z)</span>
-              {selectedCodes.length > 0 && <span className="text-blue-600 font-medium">{selectedCodes.length} item dipilih</span>}
+            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 text-xs text-slate-500 mt-4 px-1">
+              <span>Menampilkan {filtered.length ? (safePage - 1) * PAGE_SIZE + 1 : 0}–{Math.min(safePage * PAGE_SIZE, filtered.length)} dari {filtered.length.toLocaleString('id-ID')} hasil · total {itemsList.length.toLocaleString('id-ID')} data</span>
+              <div className="flex items-center gap-2">
+                {selectedCodes.length > 0 && <span className="text-blue-600 font-medium mr-2">{selectedCodes.length} item dipilih</span>}
+                <button disabled={safePage <= 1} onClick={() => setCurrentPage(1)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 disabled:opacity-40">Awal</button>
+                <button disabled={safePage <= 1} onClick={() => setCurrentPage(p => Math.max(1, p - 1))} className="px-2.5 py-1.5 rounded-lg border border-slate-200 disabled:opacity-40">Sebelumnya</button>
+                <span className="whitespace-nowrap">Halaman {safePage} / {totalPages}</span>
+                <button disabled={safePage >= totalPages} onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} className="px-2.5 py-1.5 rounded-lg border border-slate-200 disabled:opacity-40">Berikutnya</button>
+                <button disabled={safePage >= totalPages} onClick={() => setCurrentPage(totalPages)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 disabled:opacity-40">Akhir</button>
+              </div>
             </div>
           </div>
 
@@ -1768,6 +2136,24 @@
                     <button type="submit" className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-md">Simpan Data</button>
                   </div>
                 </form>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Konfirmasi Hapus Semua Master Merek */}
+          {confirmDeleteAllOpen && (
+            <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl p-6 w-full max-w-md soft-shadow text-center">
+                <div className="w-14 h-14 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center mx-auto mb-3"><i data-lucide="alert-triangle" className="w-7 h-7"></i></div>
+                <h4 className="font-bold text-slate-800 text-lg mb-2">Hapus Semua Data Master Merek?</h4>
+                <p className="text-sm text-slate-600 mb-2">Tindakan ini akan menghapus seluruh data pada tabel <strong>master_brands</strong>, bukan hanya data yang terlihat di halaman ini.</p>
+                <p className="text-xs text-rose-600 font-semibold mb-6">Data yang dihapus tidak dapat dipulihkan dari aplikasi. Pastikan kamu sudah memiliki backup jika diperlukan.</p>
+                <div className="flex justify-center gap-2">
+                  <button disabled={deletingAll} onClick={() => setConfirmDeleteAllOpen(false)} className="px-4 py-2 border border-slate-200 text-slate-600 rounded-xl text-xs font-semibold hover:bg-slate-50 disabled:opacity-50">Batal</button>
+                  <button disabled={deletingAll} onClick={executeDeleteAll} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold shadow-md shadow-rose-500/20 disabled:opacity-50">
+                    {deletingAll ? 'Menghapus...' : 'Ya, Hapus Semua'}
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -1829,6 +2215,8 @@
       const brands = mockRepo.getBrands();
       
       const [search, setSearch] = useState('');
+      const [currentPage, setCurrentPage] = useState(1);
+      const PAGE_SIZE = 100;
       const [selectedCodes, setSelectedCodes] = useState([]);
       const [showModal, setShowModal] = useState(false);
       const [editItem, setEditItem] = useState(null);
@@ -1853,11 +2241,20 @@
         }).sort((a, b) => (a.name || '').localeCompare(b.name || '', 'id', { sensitivity: 'base' }));
       }, [products, brands, repoState]);
 
-      const filtered = tableRows.filter(r => 
-        r.name.toLowerCase().includes(search.toLowerCase()) || 
-        r.code.toLowerCase().includes(search.toLowerCase()) ||
-        r.brandName.toLowerCase().includes(search.toLowerCase())
-      );
+      const filtered = useMemo(() => {
+        const q = search.trim().toLowerCase();
+        if (!q) return tableRows;
+        return tableRows.filter(r =>
+          String(r.name || '').toLowerCase().includes(q) ||
+          String(r.code || '').toLowerCase().includes(q) ||
+          String(r.originalCode || '').toLowerCase().includes(q) ||
+          String(r.brandName || '').toLowerCase().includes(q)
+        );
+      }, [tableRows, search]);
+      const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+      const safePage = Math.min(currentPage, totalPages);
+      const pageItems = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+      useEffect(() => { setCurrentPage(1); }, [search]);
 
       const handleSelectAll = (e) => {
         if (e.target.checked) setSelectedCodes(filtered.map(i => i.code));
@@ -1982,7 +2379,7 @@
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filtered.map(r => (
+                  {pageItems.map(r => (
                     <tr key={r.code} className="hover:bg-slate-50 transition">
                       <td className="py-3 px-4 text-center"><input type="checkbox" checked={selectedCodes.includes(r.code)} onChange={() => setSelectedCodes(prev => prev.includes(r.code) ? prev.filter(c => c !== r.code) : [...prev, r.code])} className="w-4 h-4 cursor-pointer" /></td>
                       <td className="py-3 px-4 font-mono font-bold text-blue-600">{r.code}</td>
@@ -1998,6 +2395,17 @@
                   ))}
                 </tbody>
               </table>
+            </div>
+            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 text-xs text-slate-500 mt-4 px-1">
+              <span>Menampilkan {filtered.length ? (safePage - 1) * PAGE_SIZE + 1 : 0}–{Math.min(safePage * PAGE_SIZE, filtered.length)} dari {filtered.length.toLocaleString('id-ID')} hasil · total {tableRows.length.toLocaleString('id-ID')} produk</span>
+              <div className="flex items-center gap-2">
+                {selectedCodes.length > 0 && <span className="text-blue-600 font-medium mr-2">{selectedCodes.length.toLocaleString('id-ID')} item dipilih</span>}
+                <button disabled={safePage <= 1} onClick={() => setCurrentPage(1)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 disabled:opacity-40">Awal</button>
+                <button disabled={safePage <= 1} onClick={() => setCurrentPage(p => Math.max(1, p - 1))} className="px-2.5 py-1.5 rounded-lg border border-slate-200 disabled:opacity-40">Sebelumnya</button>
+                <span className="whitespace-nowrap">Halaman {safePage} / {totalPages}</span>
+                <button disabled={safePage >= totalPages} onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} className="px-2.5 py-1.5 rounded-lg border border-slate-200 disabled:opacity-40">Berikutnya</button>
+                <button disabled={safePage >= totalPages} onClick={() => setCurrentPage(totalPages)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 disabled:opacity-40">Akhir</button>
+              </div>
             </div>
           </div>
 
@@ -2051,44 +2459,24 @@
               expectedHeaders={['Kode Item', 'Original Code', 'Nama Produk', 'Harga Beli']}
               onClose={() => setImportModal(false)}
               onImport={async (rows, reportProgress) => {
-                let count = 0;
-                let failed = 0;
-                const errors = [];
-                // Validasi dan tentukan merek untuk item baru / item yang belum memiliki mapping merek.
-                const prepared = [];
-                for (let i = 0; i < rows.length; i++) {
-                  const r = rows[i];
-                  const code = String(r['Kode Item'] || '').replace(/\u00a0/g, ' ').trim().toUpperCase();
-                  const name = String(r['Nama Produk'] || '').replace(/\u00a0/g, ' ').trim();
-                  if (!code || !name) { failed++; errors.push(`Baris ${i + 2}: Kode Item dan Nama Produk wajib diisi.`); continue; }
-                  const mapping = mockRepo.getBrandByItemCode(code);
-                  let brandName = mapping && mapping.brandName ? String(mapping.brandName).trim() : '';
-                  const existsInProducts = mockRepo.getProducts().some(p => String(p.code || '').trim().toUpperCase() === code);
-                  if (!brandName) {
-                    const answer = await showModernPrompt({ title: 'Tentukan Merek Produk', message: `Produk ${code} — ${name} ${existsInProducts ? 'belum memiliki merek di Master Merek' : 'adalah produk baru'}.
-Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: Wardah' });
-                    if (answer === null) { failed++; errors.push(`Baris ${i + 2} (${code}) dilewati karena merek belum dipilih.`); continue; }
-                    brandName = String(answer).trim();
-                    if (!brandName) { failed++; errors.push(`Baris ${i + 2} (${code}) dilewati karena nama merek kosong.`); continue; }
-                  }
-                  prepared.push({ code, name, brandName, originalCode: String(r['Original Code'] || '').trim().toUpperCase(), basePrice: Number(r['Harga Beli']) || 0 });
+                const prepared = rows.map((r, i) => ({
+                  code: String(r['Kode Item'] || '').replace(/\u00a0/g, ' ').trim().toUpperCase(),
+                  originalCode: String(r['Original Code'] || '').replace(/\u00a0/g, ' ').trim().toUpperCase(),
+                  name: String(r['Nama Produk'] || '').replace(/\u00a0/g, ' ').trim(),
+                  basePrice: r['Harga Beli'],
+                  excelRow: i + 2
+                }));
+                const result = await mockRepo.bulkUpsertProducts(prepared, reportProgress);
+                const details = (result.errors || []).slice(0, 3).join(' | ');
+                if (result.failed === 0) {
+                  showToast(`Import Master Produk berhasil: ${result.success.toLocaleString('id-ID')} data tersimpan${rows.length > result.uniqueCodes ? `; ${ (rows.length - result.uniqueCodes).toLocaleString('id-ID')} kode duplikat digabung` : ''}.`, 'success');
+                } else if (result.success > 0) {
+                  showToast(`Import Master Produk selesai: ${result.success.toLocaleString('id-ID')} berhasil, ${result.failed.toLocaleString('id-ID')} gagal. ${details}`, 'error');
+                } else {
+                  showToast(`Import Master Produk gagal: ${result.failed.toLocaleString('id-ID')} data. ${details}`, 'error');
                 }
-                for (let i = 0; i < prepared.length; i++) {
-                  const item = prepared[i];
-                  reportProgress?.(Math.round((i / Math.max(prepared.length, 1)) * 100), `Menyimpan ${i + 1} dari ${prepared.length}: ${item.code}...`);
-                  try {
-                    await mockRepo.addProduct({
-                      code: item.code, originalCode: item.originalCode, name: item.name,
-                      brandName: item.brandName, brandKey: item.brandName.toLowerCase(),
-                      basePrice: item.basePrice, status: 'ACTIVE'
-                    });
-                    count++;
-                  } catch (e) {
-                    failed++; errors.push(`${item.code}: ${e?.message || String(e)}`);
-                  }
-                }
-                reportProgress?.(100, `Selesai. Berhasil ${count} data; gagal/dilewati ${failed}.`);
-                showToast(failed ? `Import selesai: ${count} berhasil, ${failed} gagal/dilewati. ${errors.slice(0, 2).join(' | ')}` : `Berhasil mengimpor/memperbarui ${count} produk dan menyinkronkan Master Merek.`, failed ? 'error' : 'success');
+                setSelectedCodes([]);
+                setCurrentPage(1);
                 setImportModal(false);
               }}
             />
@@ -2103,24 +2491,71 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
     function MasterPOGroupView() {
       const [repoState, setRepoState] = useState(0);
       useEffect(() => mockRepo.subscribe(() => setRepoState(prev => prev + 1)), []);
-      
       const groups = mockRepo.getPOGroups();
       const [selectedIds, setSelectedIds] = useState([]);
       const [importModal, setImportModal] = useState(false);
+      const [searchTerm, setSearchTerm] = useState('');
+      const [page, setPage] = useState(1);
+      const [deletingAll, setDeletingAll] = useState(false);
+      const pageSize = 100;
 
-      const handleSelectAll = (e) => setSelectedIds(e.target.checked ? groups.map(g => g.id) : []);
+      const brandMap = useMemo(() => {
+        const map = new Map();
+        groups.forEach(g => {
+          const b = mockRepo.getBrandByItemCode(g.itemCode);
+          map.set(String(g.id), b ? b.brandName : '-');
+        });
+        return map;
+      }, [repoState, groups.length]);
 
-      const executeDelete = () => {
-        if(confirm(`Hapus ${selectedIds.length} grup PO?`)){
-          mockRepo.deletePOGroups(selectedIds);
-          setSelectedIds([]);
+      const filteredGroups = useMemo(() => {
+        const q = searchTerm.trim().toLocaleLowerCase('id-ID');
+        if (!q) return groups;
+        return groups.filter(g => {
+          const brandName = brandMap.get(String(g.id)) || '';
+          return [g.itemCode, g.groupName, g.productName, brandName]
+            .some(v => String(v ?? '').toLocaleLowerCase('id-ID').includes(q));
+        });
+      }, [groups, searchTerm, brandMap]);
+      const totalPages = Math.max(1, Math.ceil(filteredGroups.length / pageSize));
+      const safePage = Math.min(page, totalPages);
+      const pageItems = filteredGroups.slice((safePage - 1) * pageSize, safePage * pageSize);
+      const pageIds = pageItems.map(g => g.id);
+      const allFilteredSelected = filteredGroups.length > 0 && filteredGroups.every(g => selectedIds.includes(g.id));
+
+      const handleSelectAll = (e) => {
+        if (e.target.checked) setSelectedIds(prev => Array.from(new Set([...prev, ...filteredGroups.map(g => g.id)])));
+        else setSelectedIds(prev => prev.filter(id => !filteredGroups.some(g => g.id === id)));
+      };
+      const executeDelete = async () => {
+        if (!selectedIds.length) return;
+        if (confirm(`Hapus ${selectedIds.length.toLocaleString('id-ID')} grup PO terpilih dari database?`)) {
+          try {
+            await mockRepo.deletePOGroups(selectedIds);
+            setSelectedIds([]);
+          } catch (e) { alert('Gagal menghapus Grup PO: ' + (e?.message || e)); }
         }
       };
-
+      const executeDeleteAll = async () => {
+        if (!groups.length || deletingAll) return;
+        if (!confirm(`PERINGATAN! Hapus SEMUA ${groups.length.toLocaleString('id-ID')} data Master Grup PO dari Supabase? Tindakan ini tidak dapat dibatalkan.`)) return;
+        setDeletingAll(true);
+        try {
+          const ids = groups.map(g => g.id);
+          for (let i = 0; i < ids.length; i += 500) {
+            await mockRepo.deletePOGroups(ids.slice(i, i + 500));
+          }
+          setSelectedIds([]); setPage(1);
+          alert(`Berhasil menghapus ${ids.length.toLocaleString('id-ID')} data Master Grup PO.`);
+        } catch (e) { alert('Penghapusan tidak selesai: ' + (e?.message || e)); }
+        finally { setDeletingAll(false); }
+      };
       const handleExport = () => {
-        if(selectedIds.length === 0) return alert('Pilih data untuk diexport');
+        if (selectedIds.length === 0) return alert('Pilih data untuk diexport');
         const toExport = groups.filter(g => selectedIds.includes(g.id)).map(r => ({
-          'Kode Item': r.itemCode, 'Nama Grup': r.groupName, 'Nama Produk': r.productName
+          'No.': groups.findIndex(g => g.id === r.id) + 1,
+          'Kode Item': r.itemCode, 'Nama Grup': r.groupName, 'Nama Produk': r.productName,
+          'Nama Merek': brandMap.get(String(r.id)) || '-'
         }));
         exportToExcel(toExport, 'Master_Grup_PO');
       };
@@ -2128,18 +2563,29 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       return (
         <div className="space-y-6">
           <div className="soft-card p-6">
-            <div className="flex gap-2 mb-4 justify-end">
-              {selectedIds.length > 0 && <button onClick={executeDelete} className="px-3 py-2 bg-rose-600 text-white rounded-xl text-xs font-semibold">Hapus Massal ({selectedIds.length})</button>}
-              <button onClick={() => exportToExcel([{'Kode Item':'SKU-01', 'Nama Grup':'WINGS', 'Nama Produk':'Produk A'}], 'Template_GrupPO')} className="px-3 py-2 bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold">Template</button>
-              <button onClick={() => setImportModal(true)} className="px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold">Import Excel</button>
-              <button onClick={handleExport} className={`px-3 py-2 text-xs font-semibold rounded-xl ${selectedIds.length > 0 ? 'bg-slate-800 text-white' : 'bg-slate-200 text-slate-400'}`}>Export Excel</button>
+            <div className="flex flex-col lg:flex-row gap-3 mb-4 lg:items-center lg:justify-between">
+              <div className="relative w-full lg:max-w-md">
+                <i data-lucide="search" className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400"></i>
+                <input value={searchTerm} onChange={e => { setSearchTerm(e.target.value); setPage(1); }} placeholder="Cari kode item, grup PO, produk, atau merek..." className="w-full pl-9 pr-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-purple-200" />
+              </div>
+              <div className="flex flex-wrap gap-2 justify-end">
+                {selectedIds.length > 0 && <button onClick={executeDelete} className="px-3 py-2 bg-rose-600 text-white rounded-xl text-xs font-semibold">Hapus Massal ({selectedIds.length.toLocaleString('id-ID')})</button>}
+                <button disabled={deletingAll || groups.length === 0} onClick={executeDeleteAll} className="px-3 py-2 bg-rose-50 text-rose-700 border border-rose-200 rounded-xl text-xs font-semibold disabled:opacity-50">{deletingAll ? 'Menghapus Semua...' : 'Hapus Semua Data'}</button>
+                <button onClick={() => exportToExcel([{'No.':1,'Kode Item':'SKU-01', 'Nama Grup':'WINGS', 'Nama Produk':'Produk A','Nama Merek':'-'}], 'Template_GrupPO')} className="px-3 py-2 bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold">Template</button>
+                <button onClick={() => setImportModal(true)} className="px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold">Import Excel</button>
+                <button onClick={handleExport} className={`px-3 py-2 text-xs font-semibold rounded-xl ${selectedIds.length > 0 ? 'bg-slate-800 text-white' : 'bg-slate-200 text-slate-400'}`}>Export Excel</button>
+              </div>
             </div>
-            
+            <div className="flex flex-wrap justify-between items-center gap-2 text-xs text-slate-500 mb-3">
+              <span>Menampilkan {filteredGroups.length ? ((safePage - 1) * pageSize + 1).toLocaleString('id-ID') : 0}–{Math.min(safePage * pageSize, filteredGroups.length).toLocaleString('id-ID')} dari {filteredGroups.length.toLocaleString('id-ID')} data{searchTerm ? ' (hasil pencarian)' : ''}</span>
+              <span>{selectedIds.length.toLocaleString('id-ID')} data dipilih</span>
+            </div>
             <div className="overflow-x-auto rounded-xl border border-slate-100">
               <table className="w-full text-left text-sm">
                 <thead className="bg-slate-50 border-b text-xs font-bold text-slate-500 uppercase">
                   <tr>
-                    <th className="py-3 px-4 w-12 text-center"><input type="checkbox" onChange={handleSelectAll} checked={groups.length>0 && selectedIds.length === groups.length} className="w-4 h-4"/></th>
+                    <th className="py-3 px-4 w-12 text-center"><input type="checkbox" onChange={handleSelectAll} checked={allFilteredSelected} className="w-4 h-4" title="Pilih semua hasil pencarian"/></th>
+                    <th className="py-3 px-4 w-20">No.</th>
                     <th className="py-3 px-4">Kode Item</th>
                     <th className="py-3 px-4">Nama Grup</th>
                     <th className="py-3 px-4">Nama Produk</th>
@@ -2147,20 +2593,28 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {groups.map(g => {
-                    const brandObj = mockRepo.getBrandByItemCode(g.itemCode);
-                    return (
-                      <tr key={g.id} className="hover:bg-slate-50">
-                        <td className="py-3 px-4 text-center"><input type="checkbox" checked={selectedIds.includes(g.id)} onChange={()=>setSelectedIds(prev=>prev.includes(g.id)?prev.filter(i=>i!==g.id):[...prev, g.id])} className="w-4 h-4"/></td>
-                        <td className="py-3 px-4 font-mono font-bold text-slate-700">{g.itemCode}</td>
-                        <td className="py-3 px-4 font-bold text-blue-600">{g.groupName}</td>
-                        <td className="py-3 px-4 font-medium">{g.productName}</td>
-                        <td className="py-3 px-4 text-slate-500">{brandObj ? brandObj.brandName : '-'}</td>
-                      </tr>
-                    );
-                  })}
+                  {pageItems.map((g, idx) => (
+                    <tr key={g.id} className="hover:bg-slate-50">
+                      <td className="py-3 px-4 text-center"><input type="checkbox" checked={selectedIds.includes(g.id)} onChange={() => setSelectedIds(prev => prev.includes(g.id) ? prev.filter(i => i !== g.id) : [...prev, g.id])} className="w-4 h-4"/></td>
+                      <td className="py-3 px-4 text-slate-500">{(safePage - 1) * pageSize + idx + 1}</td>
+                      <td className="py-3 px-4 font-mono font-bold text-slate-700">{g.itemCode}</td>
+                      <td className="py-3 px-4 font-bold text-blue-600">{g.groupName}</td>
+                      <td className="py-3 px-4 font-medium">{g.productName}</td>
+                      <td className="py-3 px-4 text-slate-500">{brandMap.get(String(g.id)) || '-'}</td>
+                    </tr>
+                  ))}
+                  {pageItems.length === 0 && <tr><td colSpan="6" className="py-10 text-center text-slate-400">Tidak ada data yang cocok.</td></tr>}
                 </tbody>
               </table>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 mt-4">
+              <span className="text-xs text-slate-500">Halaman {safePage} dari {totalPages} · 100 data per halaman</span>
+              <div className="flex gap-2">
+                <button disabled={safePage <= 1} onClick={() => setPage(1)} className="px-3 py-2 border rounded-lg text-xs disabled:opacity-40">Awal</button>
+                <button disabled={safePage <= 1} onClick={() => setPage(p => Math.max(1, p - 1))} className="px-3 py-2 border rounded-lg text-xs disabled:opacity-40">Sebelumnya</button>
+                <button disabled={safePage >= totalPages} onClick={() => setPage(p => Math.min(totalPages, p + 1))} className="px-3 py-2 border rounded-lg text-xs disabled:opacity-40">Berikutnya</button>
+                <button disabled={safePage >= totalPages} onClick={() => setPage(totalPages)} className="px-3 py-2 border rounded-lg text-xs disabled:opacity-40">Akhir</button>
+              </div>
             </div>
           </div>
           {importModal && (
@@ -2179,9 +2633,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   } catch (e) { errors.push(`Baris ${i + 2}: ${e?.message || String(e)}`); }
                 }
                 const detailErrors = errors.slice(0, 3).join(' | ');
-                reportProgress?.(100, errors.length
-                  ? `Selesai: ${success} berhasil, ${errors.length} gagal.`
-                  : `Selesai: ${success} berhasil, 0 gagal.`);
+                reportProgress?.(100, errors.length ? `Selesai: ${success} berhasil, ${errors.length} gagal.` : `Selesai: ${success} berhasil, 0 gagal.`);
                 const summary = errors.length
                   ? `Import Master Grup PO selesai.\n\nBerhasil: ${success} data\nGagal: ${errors.length} data\n\nDetail kegagalan: ${detailErrors}`
                   : `Import Master Grup PO berhasil!\n\n${success} data berhasil disimpan.`;
@@ -2203,13 +2655,34 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       const [selectedIds, setSelectedIds] = useState([]);
       const [importModal, setImportModal] = useState(false);
       const [confirmDeleteModal, setConfirmDeleteModal] = useState({ isOpen: false, ids: [] });
+      const [search, setSearch] = useState('');
+      const [page, setPage] = useState(1);
+      const [deleting, setDeleting] = useState(false);
+      const pageSize = 100;
+      const filteredStocks = stocks.filter(s => `${s.itemCode || ''} ${s.productName || ''}`.toLowerCase().includes(search.trim().toLowerCase()));
+      const pageCount = Math.max(1, Math.ceil(filteredStocks.length / pageSize));
+      const safePage = Math.min(page, pageCount);
+      const pageStocks = filteredStocks.slice((safePage - 1) * pageSize, safePage * pageSize);
+      useEffect(() => { setPage(1); }, [search]);
 
-      const handleSelectAll = (e) => setSelectedIds(e.target.checked ? stocks.map(s => s.id) : []);
+      const handleSelectAll = (e) => {
+        const visibleIds = pageStocks.map(s => s.id);
+        setSelectedIds(prev => e.target.checked ? [...new Set([...prev, ...visibleIds])] : prev.filter(id => !visibleIds.includes(id)));
+      };
 
-      const executeDelete = () => {
-        mockRepo.deleteMasterStocks(confirmDeleteModal.ids);
-        setSelectedIds([]);
-        setConfirmDeleteModal({ isOpen: false, ids: [] });
+      const executeDelete = async () => {
+        if (deleting) return;
+        setDeleting(true);
+        try {
+          const result = await mockRepo.deleteMasterStocks(confirmDeleteModal.ids);
+          setSelectedIds(prev => prev.filter(id => !confirmDeleteModal.ids.includes(id)));
+          setConfirmDeleteModal({ isOpen: false, ids: [] });
+          alert(`${confirmDeleteModal.deleteAll ? 'Hapus semua data selesai' : 'Penghapusan selesai'}. ${result.deleted} data berhasil dihapus dari Supabase.`);
+        } catch (err) {
+          alert(`Penghapusan gagal. Data tidak dihapus dari tampilan lokal.\n\n${err.message || err}`);
+        } finally {
+          setDeleting(false);
+        }
       };
 
       const handleExport = () => {
@@ -2225,17 +2698,24 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       return (
         <div className="space-y-6">
           <div className="soft-card p-6">
-            <div className="flex justify-end gap-2 mb-4">
+            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
+              <div className="relative w-full md:max-w-md">
+                <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cari kode item atau nama produk..." className="w-full pl-4 pr-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" />
+              </div>
+              <div className="flex flex-wrap justify-end gap-2">
               {selectedIds.length > 0 && <button onClick={() => setConfirmDeleteModal({isOpen: true, ids: selectedIds})} className="px-3 py-2 bg-rose-600 text-white rounded-xl text-xs font-semibold shadow-md">Hapus Massal ({selectedIds.length})</button>}
+              <button disabled={deleting || stocks.length === 0} onClick={() => setConfirmDeleteModal({isOpen: true, ids: stocks.map(s => s.id), deleteAll: true})} className="px-3 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-xl text-xs font-semibold disabled:opacity-50" title="Menghapus seluruh data Master Stok dari Supabase">Hapus Semua Data</button>
               <button onClick={() => exportToExcel([{'Kode item':'SKU-01', 'Nama Produk':'Produk A', 'Stok Ecer':10, 'Stok Grosir':20, 'Stok Gudang':50}], 'Template_Master_Stok')} className="px-3 py-2 bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold">Template</button>
               <button onClick={() => setImportModal(true)} className="px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold">Import Excel</button>
               <button onClick={handleExport} className={`px-3 py-2 text-xs font-semibold rounded-xl ${selectedIds.length > 0 ? 'bg-slate-800 text-white shadow-sm' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}>Export Excel</button>
+              </div>
             </div>
+            <div className="text-xs text-slate-500 mb-3">Menampilkan {filteredStocks.length ? ((safePage - 1) * pageSize + 1).toLocaleString('id-ID') : 0}–{Math.min(safePage * pageSize, filteredStocks.length).toLocaleString('id-ID')} dari {filteredStocks.length.toLocaleString('id-ID')} produk (100 per halaman)</div>
             <div className="overflow-x-auto rounded-xl border border-slate-100">
               <table className="w-full text-left text-sm">
                 <thead className="bg-slate-50 border-b text-xs font-bold text-slate-500 uppercase">
                   <tr>
-                    <th className="py-3 px-4 w-12 text-center"><input type="checkbox" onChange={handleSelectAll} checked={stocks.length>0 && selectedIds.length === stocks.length} className="w-4 h-4"/></th>
+                    <th className="py-3 px-4 w-12 text-center"><input type="checkbox" onChange={handleSelectAll} checked={pageStocks.length>0 && pageStocks.every(s => selectedIds.includes(s.id))} className="w-4 h-4"/></th>
                     <th className="py-3 px-4">No.</th>
                     <th className="py-3 px-4">Kode item</th>
                     <th className="py-3 px-4">Nama Produk</th>
@@ -2247,12 +2727,12 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {stocks.map((s, idx) => {
+                  {pageStocks.map((s, idx) => {
                     const totalAll = (Number(s.stokEcer)||0) + (Number(s.stokGrosir)||0) + (Number(s.stokGudang)||0);
                     return (
                       <tr key={s.id} className="hover:bg-slate-50">
                         <td className="py-3 px-4 text-center"><input type="checkbox" checked={selectedIds.includes(s.id)} onChange={()=>setSelectedIds(prev=>prev.includes(s.id)?prev.filter(i=>i!==s.id):[...prev, s.id])} className="w-4 h-4"/></td>
-                        <td className="py-3 px-4 font-bold text-slate-400">{idx+1}</td>
+                        <td className="py-3 px-4 font-bold text-slate-400">{(safePage - 1) * pageSize + idx + 1}</td>
                         <td className="py-3 px-4 font-mono font-bold text-slate-700">{s.itemCode}</td>
                         <td className="py-3 px-4 font-medium">{s.productName}</td>
                         <td className="py-3 px-4 text-right">{s.stokEcer}</td>
@@ -2263,37 +2743,47 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                       </tr>
                     );
                   })}
+                  {pageStocks.length === 0 && <tr><td colSpan="9" className="py-10 text-center text-slate-400">Tidak ada data yang cocok.</td></tr>}
                 </tbody>
               </table>
+            </div>
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-3 mt-4">
+              <span className="text-xs text-slate-500">Halaman {safePage} dari {pageCount}</span>
+              <div className="flex gap-2">
+                <button disabled={safePage <= 1} onClick={() => setPage(1)} className="px-3 py-2 border rounded-lg text-xs disabled:opacity-40">Pertama</button>
+                <button disabled={safePage <= 1} onClick={() => setPage(p => Math.max(1, p - 1))} className="px-3 py-2 border rounded-lg text-xs disabled:opacity-40">Sebelumnya</button>
+                <button disabled={safePage >= pageCount} onClick={() => setPage(p => Math.min(pageCount, p + 1))} className="px-3 py-2 border rounded-lg text-xs disabled:opacity-40">Berikutnya</button>
+                <button disabled={safePage >= pageCount} onClick={() => setPage(pageCount)} className="px-3 py-2 border rounded-lg text-xs disabled:opacity-40">Terakhir</button>
+              </div>
             </div>
           </div>
           {importModal && (
             <ImportExcelModal title="Import Master Stok" expectedHeaders={['Kode item', 'Nama Produk', 'Stok Ecer', 'Stok Grosir', 'Stok Gudang']} onClose={() => setImportModal(false)}
               onImport={async (rows, reportProgress) => {
-                let success = 0; const errors = [];
-                for (let i = 0; i < rows.length; i++) {
-                  const r = rows[i];
-                  reportProgress?.(Math.round(i / Math.max(rows.length, 1) * 100), `Menyimpan stok ${i + 1} dari ${rows.length}...`);
-                  try {
-                    await mockRepo.upsertMasterStock({ itemCode: r['Kode item'], productName: r['Nama Produk'], stokEcer: Number(r['Stok Ecer']) || 0, stokGrosir: Number(r['Stok Grosir']) || 0, stokGudang: Number(r['Stok Gudang']) || 0 });
-                    success++;
-                  } catch (e) { errors.push(`Baris ${i + 2}: ${e?.message || String(e)}`); }
-                }
-                reportProgress?.(100, `Selesai: ${success} berhasil, ${errors.length} gagal.`);
-                const message = errors.length
-                  ? `Import Master Stok selesai.\n\nBerhasil: ${success} data\nGagal: ${errors.length} data\n\nDetail kegagalan: ${errors.slice(0, 3).join(' | ')}`
-                  : `Import Master Stok berhasil!\n\n${success} data berhasil disimpan.`;
-                return { success, failed: errors.length, closeAfterResult: true, message };
+                const items = rows.map(r => ({
+                  itemCode: String(r['Kode item'] ?? '').trim(),
+                  productName: String(r['Nama Produk'] ?? '').trim(),
+                  // Stok negatif diubah menjadi 0 sebelum dikirim ke Supabase.
+                  stokEcer: Math.max(0, Number(r['Stok Ecer']) || 0),
+                  stokGrosir: Math.max(0, Number(r['Stok Grosir']) || 0),
+                  stokGudang: Math.max(0, Number(r['Stok Gudang']) || 0)
+                })).filter(r => r.itemCode);
+                const result = await mockRepo.upsertMasterStocksBatch(items, reportProgress);
+                reportProgress?.(100, `Selesai: ${result.success} berhasil, ${result.failed} gagal.`);
+                const message = result.failed
+                  ? `Import Master Stok selesai.\n\nBerhasil: ${result.success} data\nGagal: ${result.failed} data\n\nContoh error: ${result.errors.slice(0, 3).map(e => `${e.itemCode}: ${e.message}`).join(' | ')}`
+                  : `Import Master Stok berhasil!\n\n${result.success} data berhasil disimpan.\nStok minus otomatis disimpan sebagai 0.`;
+                return { success: result.success, failed: result.failed, closeAfterResult: true, message };
               }} />
           )}
           {confirmDeleteModal.isOpen && (
             <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
               <div className="bg-white rounded-2xl p-6 w-full max-w-sm text-center shadow-xl">
-                <h4 className="font-bold text-slate-800 mb-2">Hapus Data Stok</h4>
-                <p className="text-xs text-slate-500 mb-6">Yakin ingin menghapus data stok terpilih?</p>
+                <h4 className="font-bold text-slate-800 mb-2">{confirmDeleteModal.deleteAll ? 'Hapus Semua Data Master Stok?' : 'Hapus Data Stok'}</h4>
+                <p className="text-xs text-slate-500 mb-6">{confirmDeleteModal.deleteAll ? `PERINGATAN: seluruh ${confirmDeleteModal.ids.length.toLocaleString('id-ID')} data Master Stok akan dihapus dari Supabase. Tindakan ini tidak dapat dibatalkan.` : `Yakin ingin menghapus ${confirmDeleteModal.ids.length.toLocaleString('id-ID')} data stok terpilih dari Supabase?`}</p>
                 <div className="flex justify-center gap-2">
-                  <button onClick={() => setConfirmDeleteModal({isOpen: false, ids: []})} className="px-4 py-2 border rounded-xl text-xs font-semibold">Batal</button>
-                  <button onClick={executeDelete} className="px-4 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold shadow-md">Hapus</button>
+                  <button disabled={deleting} onClick={() => setConfirmDeleteModal({isOpen: false, ids: []})} className="px-4 py-2 border rounded-xl text-xs font-semibold disabled:opacity-50">Batal</button>
+                  <button onClick={executeDelete} disabled={deleting} className="px-4 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold shadow-md disabled:opacity-50">{deleting ? 'Menghapus...' : confirmDeleteModal.deleteAll ? 'Ya, Hapus Semua' : 'Hapus'}</button>
                 </div>
               </div>
             </div>
@@ -2316,7 +2806,11 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       const [groupFilter, setGroupFilter] = React.useState('ALL');
       const [poFilter, setPoFilter] = React.useState('ALL');
       const [selectedIds, setSelectedIds] = React.useState([]);
+      const [poPage, setPoPage] = React.useState(1);
+      const PO_PAGE_SIZE = 100;
       const [importModal, setImportModal] = React.useState(false);
+      const [deletingAllPO, setDeletingAllPO] = React.useState(false);
+      const [deleteAllPOProgress, setDeleteAllPOProgress] = React.useState('');
 
       const uniqueGroups = React.useMemo(() => {
         const set = new Set(pos.map(p => p.groupCode).filter(Boolean));
@@ -2339,57 +2833,67 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       }, [uniquePOs, poFilter]);
 
       const tableRows = React.useMemo(() => {
+        // Lookup map menghindari .find() berulang pada ribuan detail PO.
+        const poByNumber = new Map(pos.map(p => [`${String(p.poNumber)}\u0000${String(p.groupCode || '')}`, p]));
+        const productByCode = new Map(mockRepo.getProducts().map(p => [String(p.code), p]));
+        const receiptsByPOGroup = new Map();
+        for (const receipt of receipts) {
+          const key = `${String(receipt.poNumber || '')}\u0000${String(receipt.groupCode || '')}`;
+          if (!receiptsByPOGroup.has(key)) receiptsByPOGroup.set(key, []);
+          receiptsByPOGroup.get(key).push(receipt);
+        }
         let items = poItems;
         if (groupFilter !== 'ALL') {
-          const poNums = pos.filter(p => p.groupCode === groupFilter).map(p => p.poNumber);
-          items = items.filter(it => poNums.includes(it.poNumber));
+          items = items.filter(it => String(it.groupCode || pos.find(p => String(p.poNumber) === String(it.poNumber))?.groupCode || '') === groupFilter);
         }
-        if (poFilter !== 'ALL') {
-          items = items.filter(it => it.poNumber === poFilter);
-        }
-
-        return items.map((it, idx) => {
-          const po = pos.find(p => p.poNumber === it.poNumber);
-          const prd = mockRepo.getProducts().find(p => p.code === it.productCode);
-          
-          let qtyDatang = '-';
-          let keterangan = 'Sedang dalam pengiriman';
-          
-          // Sinkronisasi dengan Penerimaan Barang
-          const poReceipts = receipts.filter(r => r.poNumber === it.poNumber && r.groupCode === po?.groupCode);
+        if (poFilter !== 'ALL') items = items.filter(it => String(it.poNumber) === String(poFilter));
+        return items.map(it => {
+          const itemGroup = String(it.groupCode || '');
+          const po = poByNumber.get(`${String(it.poNumber)}\u0000${itemGroup}`) || pos.find(p => String(p.poNumber) === String(it.poNumber) && (!itemGroup || String(p.groupCode || '') === itemGroup));
+          const prd = productByCode.get(String(it.productCode));
+          const poReceipts = receiptsByPOGroup.get(`${String(it.poNumber || '')}\u0000${String(po?.groupCode || '')}`) || [];
+          let qtyDatang = '-'; let keterangan = 'Sedang dalam pengiriman';
           if (poReceipts.length > 0) {
-             const exactReceipts = poReceipts.filter(r => r.productCode === it.productCode);
-             if (exactReceipts.length > 0) {
-                 qtyDatang = exactReceipts.reduce((sum, r) => sum + Number(r.qtyReceived), 0);
-                 keterangan = 'Sudah diterima';
-             } else {
-                 qtyDatang = 0;
-                 keterangan = 'Tidak datang';
-             }
+            const exact = poReceipts.filter(r => String(r.productCode) === String(it.productCode));
+            qtyDatang = exact.length ? exact.reduce((sum, r) => sum + Number(r.qtyReceived || 0), 0) : 0;
+            keterangan = exact.length ? 'Sudah diterima' : 'Tidak datang';
           }
-
-          return {
-            id: it.id,
-            tanggalPO: po ? po.orderDate : '-',
-            noPO: it.poNumber,
-            grupPO: po ? po.groupCode : '-',
-            originalCode: prd ? prd.originalCode : '-',
-            productName: prd ? prd.name : it.productCode,
-            qtyOrder: it.qtyOrder,
-            jumlahNominal: Number(it.qtyOrder) * Number(it.unitPrice),
-            qtyDatang,
-            keterangan
-          };
+          return { id: it.id, tanggalPO: po ? po.orderDate : '-', noPO: it.poNumber,
+            grupPO: po ? po.groupCode : '-', originalCode: prd ? prd.originalCode : '-',
+            productName: prd ? prd.name : it.productCode, qtyOrder: it.qtyOrder,
+            jumlahNominal: Number(it.qtyOrder) * Number(it.unitPrice), qtyDatang, keterangan };
         });
       }, [pos, poItems, receipts, groupFilter, poFilter, repoState]);
+      const poTotalPages = Math.max(1, Math.ceil(tableRows.length / PO_PAGE_SIZE));
+      const safePoPage = Math.min(poPage, poTotalPages);
+      const visibleTableRows = React.useMemo(() => tableRows.slice((safePoPage - 1) * PO_PAGE_SIZE, safePoPage * PO_PAGE_SIZE), [tableRows, safePoPage]);
+      React.useEffect(() => { setPoPage(1); }, [groupFilter, poFilter]);
 
       const handleSelectAll = (e) => setSelectedIds(e.target.checked ? tableRows.map(r => r.id) : []);
       
-      const executeDelete = () => {
-        if(confirm(`Yakin ingin menghapus ${selectedIds.length} item PO?`)) {
-          mockRepo.deletePOItems(selectedIds);
+      const executeDelete = async () => {
+        if (!confirm(`Yakin ingin menghapus ${selectedIds.length} item detail PO?`)) return;
+        try {
+          await mockRepo.deletePOItems(selectedIds);
           setSelectedIds([]);
-        }
+          alert('Detail PO berhasil dihapus dari Supabase.');
+        } catch (err) { alert(`Penghapusan gagal: ${err.message || err}`); }
+      };
+      const executeDeleteAllPO = async () => {
+        const totalItems = mockRepo.getPOItems().length;
+        const totalHeaders = mockRepo.getPOs().length;
+        if (!totalItems && !totalHeaders) return alert('Tidak ada data Purchase Order untuk dihapus.');
+        if (!confirm(`PERINGATAN: Hapus SEMUA data Purchase Order?\n\nDetail PO: ${totalItems.toLocaleString('id-ID')} baris\nHeader PO: ${totalHeaders.toLocaleString('id-ID')} data\n\nTindakan ini tidak dapat dibatalkan.`)) return;
+        setDeletingAllPO(true); setDeleteAllPOProgress('Menyiapkan penghapusan...');
+        try {
+          const result = await mockRepo.deleteAllPOData(({stage, done, total}) => {
+            setDeleteAllPOProgress(stage === 'detail' ? `Menghapus detail PO ${done.toLocaleString('id-ID')} / ${total.toLocaleString('id-ID')}` : `Menghapus header PO ${done.toLocaleString('id-ID')} / ${total.toLocaleString('id-ID')}`);
+          });
+          setSelectedIds([]);
+          alert(`Selesai. Detail dihapus: ${result.deletedItems.toLocaleString('id-ID')}; header dihapus: ${result.deletedHeaders.toLocaleString('id-ID')}.`);
+        } catch (err) {
+          alert(`Penghapusan berhenti karena Supabase mengembalikan error: ${err.message || err}. Periksa data yang tersisa sebelum mencoba lagi.`);
+        } finally { setDeletingAllPO(false); setDeleteAllPOProgress(''); }
       };
 
       const handleExport = () => {
@@ -2426,12 +2930,14 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   <button onClick={executeDelete} className="px-3 py-2 bg-rose-600 text-white rounded-xl text-xs font-semibold shadow-md">Hapus Massal ({selectedIds.length})</button>
                 )}
               </div>
-              <div className="flex gap-2 items-center">
-                <button onClick={() => exportToExcel([{'Tanggal PO':'10/01/2026', 'No. PO':'PO-001', 'Grup PO':'WINGS', 'Original Code':'OC-01', 'Nama Produk':'Produk A', 'Qty Order':100, 'Jumlah Nominal': 1500000}], 'Template_PO')} className="px-3 py-2 bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold">Template</button>
+              <div className="flex flex-wrap gap-2 items-center">
+                <button disabled={deletingAllPO} onClick={executeDeleteAllPO} className="px-3 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold disabled:opacity-50">{deletingAllPO ? 'Menghapus Semua...' : 'Hapus Semua Data PO'}</button>
+                <button onClick={() => exportToExcel([{'Tanggal PO':'10/01/2026', 'No. PO':'PO-001', 'Grup PO':'WINGS', 'No.':1, 'Original Code':'OC-01', 'Nama Produk':'Produk A', 'Qty Order':100, 'Jumlah Nominal': 1500000}], 'Template_PO')} className="px-3 py-2 bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold">Template</button>
                 <button onClick={() => setImportModal(true)} className="px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold">Import Excel</button>
                 <button onClick={handleExport} className={`px-3 py-2 text-xs font-semibold rounded-xl ${selectedIds.length > 0 ? 'bg-slate-800 text-white shadow-sm' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}>Export Excel</button>
               </div>
             </div>
+            {deletingAllPO && <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{deleteAllPOProgress || 'Penghapusan sedang berlangsung. Jangan tutup halaman ini.'}</div>}
 
             <div className="overflow-x-auto rounded-xl border border-slate-100">
               <table className="w-full text-left text-sm whitespace-nowrap">
@@ -2451,13 +2957,13 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {tableRows.map((r, idx) => (
+                  {visibleTableRows.map((r, idx) => (
                     <tr key={r.id} className="hover:bg-slate-50">
                       <td className="py-3 px-4 text-center"><input type="checkbox" checked={selectedIds.includes(r.id)} onChange={() => setSelectedIds(prev => prev.includes(r.id) ? prev.filter(c => c !== r.id) : [...prev, r.id])} className="w-4 h-4" /></td>
                       <td className="py-3 px-4">{formatDateDMY(r.tanggalPO)}</td>
                       <td className="py-3 px-4 font-bold text-blue-600">{r.noPO}</td>
                       <td className="py-3 px-4 font-semibold text-slate-700">{r.grupPO}</td>
-                      <td className="py-3 px-4 font-bold text-slate-400">{idx + 1}</td>
+                      <td className="py-3 px-4 font-bold text-slate-400">{(safePoPage - 1) * PO_PAGE_SIZE + idx + 1}</td>
                       <td className="py-3 px-4 font-mono text-slate-500">{r.originalCode}</td>
                       <td className="py-3 px-4 font-medium">{r.productName}</td>
                       <td className="py-3 px-4 text-right font-bold text-slate-700">{r.qtyOrder}</td>
@@ -2471,32 +2977,115 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                 </tbody>
               </table>
             </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 mt-4 text-xs text-slate-500">
+              <span>Menampilkan {tableRows.length ? ((safePoPage - 1) * PO_PAGE_SIZE + 1).toLocaleString('id-ID') : 0}–{Math.min(safePoPage * PO_PAGE_SIZE, tableRows.length).toLocaleString('id-ID')} dari {tableRows.length.toLocaleString('id-ID')} baris PO</span>
+              <div className="flex items-center gap-2">
+                <button disabled={safePoPage <= 1} onClick={() => setPoPage(1)} className="px-3 py-2 rounded-lg border disabled:opacity-40">Awal</button>
+                <button disabled={safePoPage <= 1} onClick={() => setPoPage(p => Math.max(1, p - 1))} className="px-3 py-2 rounded-lg border disabled:opacity-40">Sebelumnya</button>
+                <span className="px-2 font-semibold">Halaman {safePoPage} / {poTotalPages}</span>
+                <button disabled={safePoPage >= poTotalPages} onClick={() => setPoPage(p => Math.min(poTotalPages, p + 1))} className="px-3 py-2 rounded-lg border disabled:opacity-40">Berikutnya</button>
+                <button disabled={safePoPage >= poTotalPages} onClick={() => setPoPage(poTotalPages)} className="px-3 py-2 rounded-lg border disabled:opacity-40">Akhir</button>
+              </div>
+            </div>
           </div>
           {importModal && (
-            <ImportExcelModal title="Import Purchase Order" expectedHeaders={['Tanggal PO', 'No. PO', 'Grup PO', 'Original Code', 'Nama Produk', 'Qty Order', 'Jumlah Nominal']} onClose={() => setImportModal(false)}
+            <ImportExcelModal title="Import Purchase Order" expectedHeaders={['Tanggal PO', 'No. PO', 'Grup PO', 'No.', 'Original Code', 'Nama Produk', 'Qty Order', 'Jumlah Nominal']} onClose={() => setImportModal(false)}
               onImport={async (rows, reportProgress) => {
-                 const grouped = new Map(); const errors = [];
-                 rows.forEach((r, idx) => {
+                 // Optimasi: siapkan indeks produk sekali, bukan mencari ulang seluruh Master Produk untuk setiap baris.
+                 const products = mockRepo.getProducts();
+                 const byCode = new Map(); const byOriginal = new Map();
+                 products.forEach(p => {
+                   const code = String(p.code || '').trim().toUpperCase();
+                   const original = String(p.originalCode || '').trim().toUpperCase();
+                   if (code) byCode.set(code, p);
+                   if (original) byOriginal.set(original, p);
+                 });
+                 const grouped = new Map(), errors = [], brandTasks = new Map(), groupTasks = new Map();
+                 const existingBrandCodes = new Set(mockRepo.getBrands().map(b => String(b.itemCode || b.item_code || b.code || '').trim().toUpperCase()).filter(Boolean));
+                 const existingGroupKeys = new Set(mockRepo.getPOGroups().map(g => `${String(g.itemCode || g.item_code || '').trim().toUpperCase()}\u0000${String(g.groupName || g.group_name || '').trim().toLowerCase()}`));
+                 reportProgress?.(2, `Membaca ${rows.length.toLocaleString('id-ID')} baris dan mencocokkan produk...`);
+                 for (let idx = 0; idx < rows.length; idx++) {
+                   const r = rows[idx];
                    const poNumber = String(r['No. PO'] || '').trim();
                    const groupCode = String(r['Grup PO'] || '').trim();
                    const productCode = String(r['Original Code'] || '').trim().toUpperCase();
                    const qty = Number(r['Qty Order']) || 0; const amount = Number(r['Jumlah Nominal']) || 0;
-                   if (!poNumber || !groupCode || !productCode || qty <= 0) { errors.push(`Baris ${idx + 2}: No. PO, Grup PO, Original Code, dan Qty Order wajib valid.`); return; }
-                   if (!mockRepo.getProducts().some(p => String(p.originalCode || '').trim().toUpperCase() === productCode || String(p.code || '').trim().toUpperCase() === productCode)) { errors.push(`Baris ${idx + 2}: produk ${productCode} tidak ditemukan di Master Produk.`); return; }
-                   const actualCode = (mockRepo.getProducts().find(p => String(p.originalCode || '').trim().toUpperCase() === productCode || String(p.code || '').trim().toUpperCase() === productCode) || {}).code;
-                   if (!grouped.has(poNumber)) grouped.set(poNumber, { po: { poNumber, groupCode, orderDate: parseDMYtoYMD(r['Tanggal PO']), status: 'OPEN' }, items: [] });
-                   grouped.get(poNumber).items.push({ productCode: actualCode, qtyOrder: qty, unitPrice: amount / qty });
-                 });
-                 let success = 0; let i = 0;
-                 for (const [poNumber, pack] of grouped) {
-                   reportProgress?.(Math.round(i / Math.max(grouped.size, 1) * 100), `Menyimpan PO ${i + 1} dari ${grouped.size}: ${poNumber}...`);
-                   try { await mockRepo.addPO(pack.po, pack.items); success++; }
-                   catch (e) { errors.push(`${poNumber}: ${e?.message || String(e)}`); }
-                   i++;
+                   if (!poNumber || !groupCode || !productCode || qty <= 0) { errors.push(`Baris ${idx + 2}: No. PO, Grup PO, Original Code, dan Qty Order wajib valid.`); continue; }
+                   const matchedProduct = byOriginal.get(productCode) || byCode.get(productCode);
+                   if (!matchedProduct?.code) { errors.push(`Baris ${idx + 2}: produk ${productCode} tidak ditemukan di Master Produk.`); continue; }
+                   const actualCode = String(matchedProduct.code).trim();
+                   const productName = String(matchedProduct.name || r['Nama Produk'] || '').trim();
+                   const brand = productName.split(/\s+/)[0] || '';
+                   const brandKey = actualCode.toUpperCase();
+                   if (brand && !existingBrandCodes.has(brandKey) && !brandTasks.has(brandKey)) brandTasks.set(brandKey, { actualCode, brand, productName, rowNum: idx + 2 });
+                   const groupKey = `${actualCode.toUpperCase()}\u0000${groupCode.toLowerCase()}`;
+                   if (!existingGroupKeys.has(groupKey) && !groupTasks.has(groupKey)) groupTasks.set(groupKey, { actualCode, groupCode, productName, rowNum: idx + 2 });
+                   const poGroupKey = `${poNumber}\u0000${groupCode.toLowerCase()}`;
+                   if (!grouped.has(poGroupKey)) grouped.set(poGroupKey, { po: { poNumber, groupCode, orderDate: parseDMYtoYMD(r['Tanggal PO']), status: 'OPEN' }, items: [] });
+                   grouped.get(poGroupKey).items.push({ productCode: actualCode, qtyOrder: qty, unitPrice: amount / qty });
+                   if (idx % 200 === 0) reportProgress?.(Math.round((idx / Math.max(rows.length, 1)) * 25), `Memeriksa baris ${idx + 1} dari ${rows.length}...`);
                  }
+                 // OPTIMASI AMAN: upsert master secara batch agar tidak melakukan ribuan request satu per satu.
+                 // Batch kecil memudahkan pelacakan error dan menghindari payload terlalu besar.
+                 const saveInBatches = async (entries, batchSize, label, base, span, makePayload, table, conflict) => {
+                   let done = 0;
+                   for (let start = 0; start < entries.length; start += batchSize) {
+                     const batch = entries.slice(start, start + batchSize);
+                     const payload = batch.map(makePayload);
+                     try {
+                       const { error } = await supabase.from(table).upsert(payload, { onConflict: conflict });
+                       if (error) {
+                         // Jika satu batch ditolak, coba per baris supaya data valid tetap tersimpan dan error spesifik diketahui.
+                         for (const entry of batch) {
+                           try {
+                             const { error: oneError } = await supabase.from(table).upsert([makePayload(entry)], { onConflict: conflict });
+                             if (oneError) errors.push(`Baris ${entry.rowNum}: ${label}: ${oneError.message}`);
+                           } catch (oneErr) { errors.push(`Baris ${entry.rowNum}: ${label}: ${oneErr?.message || String(oneErr)}`); }
+                         }
+                       }
+                     } catch (e) {
+                       for (const entry of batch) errors.push(`Baris ${entry.rowNum}: ${label}: ${e?.message || String(e)}`);
+                     }
+                     done += batch.length;
+                     reportProgress?.(base + Math.round(done / Math.max(entries.length, 1) * span), `${label}: ${done.toLocaleString('id-ID')} dari ${entries.length.toLocaleString('id-ID')}...`);
+                   }
+                 };
+                 const brandEntries = [...brandTasks.values()];
+                 await saveInBatches(brandEntries, 250, 'Melengkapi Master Merek', 25, 15,
+                   t => ({ item_code: t.actualCode, product_name: t.productName, brand_name: t.brand }),
+                   'master_brands', 'item_code');
+                 const groupEntries = [...groupTasks.values()];
+                 await saveInBatches(groupEntries, 250, 'Melengkapi Master Grup PO', 40, 15,
+                   t => ({ item_code: t.actualCode, group_name: t.groupCode }),
+                   'master_po_groups', 'item_code,group_name');
+                 // Perbarui cache lokal sekali setelah master berhasil diproses.
+                 try {
+                   brandEntries.forEach(t => {
+                     const code = String(t.actualCode).trim().toUpperCase();
+                     if (!mockRepo.brandMappings.some(m => String(m.itemCode || '').trim().toUpperCase() === code)) mockRepo.brandMappings.push({ id: `BM-${code}`, itemCode: code, productName: t.productName, brandName: t.brand });
+                     if (!mockRepo.brands.some(b => String(b.name || '').toLowerCase() === t.brand.toLowerCase())) mockRepo.brands.push({ id: t.brand.toLowerCase(), code: t.brand.toLowerCase(), name: t.brand, status: 'ACTIVE' });
+                   });
+                   groupEntries.forEach(t => {
+                     if (!mockRepo.poGroups.some(g => String(g.itemCode || '').trim().toUpperCase() === String(t.actualCode).trim().toUpperCase() && String(g.groupName || '').trim().toLowerCase() === t.groupCode.toLowerCase())) mockRepo.poGroups.push({ id: `${t.actualCode}-${t.groupCode}`, itemCode: t.actualCode, groupName: t.groupCode, productName: t.productName });
+                   });
+                 } catch (cacheErr) { console.warn('Cache master PO tidak dapat diperbarui:', cacheErr); }
+                 mockRepo.notify();
+                 const poEntries = [...grouped.entries()]; let success = 0, nextPO = 0, donePO = 0;
+                 const poWorkers = Array.from({length: Math.min(4, poEntries.length)}, async () => {
+                   while (true) {
+                     const i = nextPO++; if (i >= poEntries.length) break;
+                     const [poGroupKey, pack] = poEntries[i];
+                     const poLabel = `${pack.po.poNumber} / ${pack.po.groupCode}`;
+                     reportProgress?.(60 + Math.round(donePO / Math.max(poEntries.length, 1) * 39), `Menyimpan PO ${donePO + 1} dari ${poEntries.length}: ${poLabel}...`);
+                     try { await mockRepo.addPO(pack.po, pack.items); success++; }
+                     catch (e) { errors.push(`${poLabel}: ${e?.message || String(e)}`); }
+                     donePO++;
+                   }
+                 });
+                 await Promise.all(poWorkers);
                  reportProgress?.(100, `Selesai: ${success} PO tersimpan, ${errors.length} masalah.`);
                  const message = errors.length
-                   ? `Import Purchase Order selesai.\n\nBerhasil: ${success} PO\nGagal/bermasalah: ${errors.length} baris atau PO\n\nDetail: ${errors.slice(0, 3).join(' | ')}`
+                   ? `Import Purchase Order selesai.\n\nBerhasil: ${success} PO\nGagal/bermasalah: ${errors.length} baris atau PO\n\nDaftar detail kegagalan:\n${errors.join('\n')}`
                    : `Import Purchase Order berhasil!\n\n${success} PO berhasil disimpan.`;
                  return { success, failed: errors.length, closeAfterResult: true, message };
               }} />
@@ -2518,6 +3107,11 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       const [poFilter, setPoFilter] = React.useState('ALL');
       const [selectedIds, setSelectedIds] = React.useState([]);
       const [importModal, setImportModal] = React.useState(false);
+      const [deletingAllPO, setDeletingAllPO] = React.useState(false);
+      const [deleteAllPOProgress, setDeleteAllPOProgress] = React.useState('');
+      const [search, setSearch] = React.useState('');
+      const [page, setPage] = React.useState(1);
+      const pageSize = 100;
 
       const uniqueGroups = React.useMemo(() => Array.from(new Set(pos.map(p => p.groupCode).filter(Boolean))).sort(), [pos]);
       const uniquePOs = React.useMemo(() => {
@@ -2527,14 +3121,20 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       React.useEffect(() => { if (poFilter !== 'ALL' && !uniquePOs.includes(poFilter)) setPoFilter('ALL'); }, [uniquePOs, poFilter]);
 
       const filtered = receipts.filter(r => {
-        return (groupFilter === 'ALL' || r.groupCode === groupFilter) && (poFilter === 'ALL' || r.poNumber === poFilter);
+        const q = search.trim().toLowerCase();
+        const matchesSearch = !q || [r.poNumber, r.groupCode, r.noBarcode, r.productName, r.receiverName, r.productCode]
+          .some(v => String(v || '').toLowerCase().includes(q));
+        return matchesSearch && (groupFilter === 'ALL' || r.groupCode === groupFilter) && (poFilter === 'ALL' || r.poNumber === poFilter);
       });
+      const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+      const safePage = Math.min(page, pageCount);
+      const pageItems = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
+      React.useEffect(() => { setPage(1); }, [search, groupFilter, poFilter]);
 
       const handleSelectAll = (e) => setSelectedIds(e.target.checked ? filtered.map(r => r.id) : []);
       const executeDelete = () => {
         if(confirm(`Hapus ${selectedIds.length} penerimaan barang?`)) {
-          mockRepo.deleteGoodsReceipts(selectedIds);
-          setSelectedIds([]);
+          mockRepo.deleteGoodsReceipts(selectedIds).then(() => setSelectedIds([])).catch(e => alert('Gagal menghapus: ' + e.message));
         }
       };
       
@@ -2549,6 +3149,10 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
 
       return (
         <div className="space-y-6">
+          <div className="flex flex-wrap items-center gap-3">
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cari No. PO, Grup PO, barcode, nama barang..." className="px-4 py-2 border rounded-xl text-sm flex-1 min-w-[260px]" />
+            <button onClick={async () => { if (!confirm(`Yakin menghapus SELURUH ${receipts.length.toLocaleString('id-ID')} data Penerimaan Barang? Tindakan ini tidak dapat dibatalkan.`)) return; try { setDeletingAllPO(true); setDeleteAllPOProgress('Menghapus seluruh data...'); await mockRepo.deleteAllGoodsReceipts(); setSelectedIds([]); alert('Semua data Penerimaan Barang berhasil dihapus.'); } catch(e) { alert('Gagal menghapus semua data: ' + e.message); } finally { setDeletingAllPO(false); setDeleteAllPOProgress(''); } }} disabled={deletingAllPO} className="px-4 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold disabled:opacity-50">{deletingAllPO ? (deleteAllPOProgress || 'Menghapus...') : 'Hapus Semua Data'}</button>
+          </div>
           <div className="soft-card p-6">
             <div className="flex flex-wrap gap-4 items-center justify-between mb-6">
               <div className="flex gap-3 items-center">
@@ -2563,7 +3167,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                 {selectedIds.length > 0 && <button onClick={executeDelete} className="px-3 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold shadow-md">Hapus Massal ({selectedIds.length})</button>}
               </div>
               <div className="flex gap-2">
-                <button onClick={() => exportToExcel([{'Tanggal':'15/01/2026', 'Nama Penerima':'Budi', 'No. PO':'PO-001', 'Grup PO':'WINGS', 'NoBarcode':'OC-01', 'Nama Barang':'Produk A', 'Qty Order':100, 'Qty Datang': 100}], 'Template_GR')} className="px-3 py-2 bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold">Template</button>
+                <button onClick={() => exportToExcel([{'Tanggal':'15/01/2026', 'Nama Penerima':'Budi', 'No. PO':'PO-001', 'Grup PO':'WINGS', 'No.':'1', 'NoBarcode':'OC-01', 'Nama Barang':'Produk A', 'Qty Order':100, 'Qty Datang': 100}], 'Template_GR')} className="px-3 py-2 bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold">Template</button>
                 <button onClick={() => setImportModal(true)} className="px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold">Import Excel</button>
                 <button onClick={handleExport} className={`px-3 py-2 text-xs font-semibold rounded-xl ${selectedIds.length > 0 ? 'bg-slate-800 text-white' : 'bg-slate-200 text-slate-400'}`}>Export Excel</button>
               </div>
@@ -2578,6 +3182,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                     <th className="py-3 px-4">Nama Penerima</th>
                     <th className="py-3 px-4">No. PO</th>
                     <th className="py-3 px-4">Grup PO</th>
+                    <th className="py-3 px-4">No.</th>
                     <th className="py-3 px-4">NoBarcode</th>
                     <th className="py-3 px-4">Nama Barang</th>
                     <th className="py-3 px-4 text-right">Qty Order</th>
@@ -2585,13 +3190,14 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filtered.map(r => (
+                  {pageItems.map((r, idx) => (
                     <tr key={r.id} className="hover:bg-slate-50">
                       <td className="py-3 px-4 text-center"><input type="checkbox" checked={selectedIds.includes(r.id)} onChange={() => setSelectedIds(prev => prev.includes(r.id) ? prev.filter(c => c !== r.id) : [...prev, r.id])} className="w-4 h-4" /></td>
                       <td className="py-3 px-4">{formatDateDMY(r.receiptDate)}</td>
                       <td className="py-3 px-4 text-slate-700">{r.receiverName}</td>
                       <td className="py-3 px-4 font-bold text-blue-600">{r.poNumber}</td>
                       <td className="py-3 px-4 font-semibold">{r.groupCode}</td>
+                      <td className="py-3 px-4">{(safePage - 1) * pageSize + idx + 1}</td>
                       <td className="py-3 px-4 font-mono text-slate-500">{r.noBarcode}</td>
                       <td className="py-3 px-4">{r.productName}</td>
                       <td className="py-3 px-4 text-right text-slate-700">{formatNum(r.qtyOrder)}</td>
@@ -2601,22 +3207,41 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                 </tbody>
               </table>
             </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 mt-4 text-sm text-slate-600">
+              <span>Menampilkan {filtered.length ? (safePage - 1) * pageSize + 1 : 0}–{Math.min(safePage * pageSize, filtered.length)} dari {filtered.length.toLocaleString('id-ID')} data · 100 baris/halaman</span>
+              <div className="flex gap-2">
+                <button onClick={() => setPage(1)} disabled={safePage === 1} className="px-3 py-2 border rounded-lg disabled:opacity-40">Awal</button>
+                <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={safePage === 1} className="px-3 py-2 border rounded-lg disabled:opacity-40">Sebelumnya</button>
+                <span className="px-3 py-2">Halaman {safePage} / {pageCount}</span>
+                <button onClick={() => setPage(p => Math.min(pageCount, p + 1))} disabled={safePage >= pageCount} className="px-3 py-2 border rounded-lg disabled:opacity-40">Berikutnya</button>
+                <button onClick={() => setPage(pageCount)} disabled={safePage >= pageCount} className="px-3 py-2 border rounded-lg disabled:opacity-40">Akhir</button>
+              </div>
+            </div>
           </div>
-          {importModal && <ImportExcelModal title="Import Penerimaan Barang" expectedHeaders={['Tanggal', 'Nama Penerima', 'No. PO', 'Grup PO', 'NoBarcode', 'Nama Barang', 'Qty Order', 'Qty Datang']} onClose={() => setImportModal(false)} onImport={async (rows, reportProgress) => {
-            let success = 0; const errors = [];
-            for (let i = 0; i < rows.length; i++) {
-              const r = rows[i]; reportProgress?.(Math.round(i / Math.max(rows.length, 1) * 100), `Menyimpan penerimaan ${i + 1} dari ${rows.length}...`);
-              try {
-                const productName = String(r['Nama Barang'] || '').trim();
-                const prod = mockRepo.getProducts().find(p => String(p.name || '').trim().toLowerCase() === productName.toLowerCase() || String(p.originalCode || '').trim().toUpperCase() === String(r['NoBarcode'] || '').trim().toUpperCase() || String(p.code || '').trim().toUpperCase() === String(r['NoBarcode'] || '').trim().toUpperCase());
-                if (!prod) throw new Error(`Produk "${productName || r['NoBarcode']}" tidak ditemukan di Master Produk (cocokkan NoBarcode dengan Original Code/Kode Item).`);
-                await mockRepo.addGoodsReceipt({ receiptDate: parseDMYtoYMD(r['Tanggal']), receiverName: String(r['Nama Penerima'] || '').trim(), poNumber: String(r['No. PO'] || '').trim(), groupCode: String(r['Grup PO'] || '').trim(), noBarcode: String(r['NoBarcode'] || '').trim(), productCode: prod.code, productName: prod.name, qtyOrder: Number(r['Qty Order']) || 0, qtyReceived: Number(r['Qty Datang']) || 0 }); success++;
-              } catch (e) { errors.push(`Baris ${i + 2}: ${e?.message || String(e)}`); }
+          {importModal && <ImportExcelModal title="Import Penerimaan Barang" expectedHeaders={['Tanggal', 'Nama Penerima', 'No. PO', 'Grup PO', 'No.', 'NoBarcode', 'Nama Barang', 'Qty Order', 'Qty Datang']} onClose={() => setImportModal(false)} onImport={async (rows, reportProgress) => {
+            let success = 0; const errors = []; const batchSize = 250; const products = mockRepo.getProducts();
+            const byName = new Map(), byCode = new Map();
+            products.forEach(p => { if (p.name) byName.set(String(p.name).trim().toLowerCase(), p); if (p.originalCode) byCode.set(String(p.originalCode).trim().toUpperCase(), p); if (p.code) byCode.set(String(p.code).trim().toUpperCase(), p); });
+            const prepared = [];
+            rows.forEach((r, idx) => {
+              const productName = String(r['Nama Barang'] || '').trim(); const barcode = String(r['NoBarcode'] || '').trim().toUpperCase();
+              const prod = byName.get(productName.toLowerCase()) || byCode.get(barcode);
+              if (!prod) { errors.push(`Baris ${idx + 2}: Produk "${productName || barcode}" tidak ditemukan di Master Produk.`); return; }
+              prepared.push({ rowNumber: idx + 2, item: { receiptDate: parseDMYtoYMD(r['Tanggal']), receiverName: String(r['Nama Penerima'] || '').trim(), poNumber: String(r['No. PO'] || '').trim(), groupCode: String(r['Grup PO'] || '').trim(), noBarcode: String(r['NoBarcode'] || '').trim(), productCode: prod.code, productName: prod.name, qtyOrder: Number(r['Qty Order']) || 0, qtyReceived: Number(r['Qty Datang']) || 0 } });
+            });
+            for (let i = 0; i < prepared.length; i += batchSize) {
+              const batch = prepared.slice(i, i + batchSize);
+              reportProgress?.(Math.round(i / Math.max(prepared.length, 1) * 100), `Menyimpan batch ${Math.floor(i / batchSize) + 1} dari ${Math.ceil(prepared.length / batchSize)} (${i + 1}–${Math.min(i + batch.length, prepared.length)})...`);
+              try { await mockRepo.addGoodsReceiptsBatch(batch.map(x => x.item)); success += batch.length; }
+              catch (batchError) {
+                for (const entry of batch) {
+                  try { await mockRepo.addGoodsReceipt(entry.item); success++; }
+                  catch (e) { errors.push(`Baris ${entry.rowNumber}: ${e?.message || String(e)}`); }
+                }
+              }
             }
             reportProgress?.(100, `Selesai: ${success} berhasil, ${errors.length} gagal.`);
-            const message = errors.length
-              ? `Import Penerimaan Barang selesai.\n\nBerhasil: ${success} data\nGagal: ${errors.length} data\n\nDetail kegagalan: ${errors.slice(0, 3).join(' | ')}`
-              : `Import Penerimaan Barang berhasil!\n\n${success} data berhasil disimpan.`;
+            const message = errors.length ? `Import Penerimaan Barang selesai.\n\nBerhasil: ${success} data\nGagal: ${errors.length} data\n\nDetail kegagalan:\n${errors.slice(0, 15).join('\n')}` : `Import Penerimaan Barang berhasil!\n\n${success} data berhasil disimpan.`;
             return { success, failed: errors.length, closeAfterResult: true, message };
           }} />}
         </div>
@@ -2630,88 +3255,105 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       const [repoState, setRepoState] = React.useState(0);
       React.useEffect(() => mockRepo.subscribe(() => setRepoState(prev => prev + 1)), []);
       const salesData = mockRepo.getSalesRecords();
-      
       const [selectedIds, setSelectedIds] = React.useState([]);
       const [importModal, setImportModal] = React.useState(false);
-
-      const handleSelectAll = (e) => setSelectedIds(e.target.checked ? salesData.map(s => s.id) : []);
-      const executeDelete = () => {
-        if(confirm(`Hapus ${selectedIds.length} data penjualan?`)) {
-          mockRepo.deleteSalesRecords(selectedIds);
+      const [deletingAllSales, setDeletingAllSales] = React.useState(false);
+      const [deleteProgress, setDeleteProgress] = React.useState(0);
+      const [deleteStatus, setDeleteStatus] = React.useState('');
+      const [salesPage, setSalesPage] = React.useState(1);
+      const pageSize = 100;
+      const totalPages = Math.max(1, Math.ceil(salesData.length / pageSize));
+      React.useEffect(() => { if (salesPage > totalPages) setSalesPage(totalPages); }, [salesData.length, salesPage, totalPages]);
+      const pageRows = salesData.slice((salesPage - 1) * pageSize, salesPage * pageSize);
+      const handleSelectAll = (e) => setSelectedIds(prev => e.target.checked
+        ? [...new Set([...prev, ...pageRows.map(s => s.id)])]
+        : prev.filter(id => !pageRows.some(s => String(s.id) === String(id))));
+      const executeDelete = async () => {
+        if (!selectedIds.length || !confirm(`Hapus ${selectedIds.length} data penjualan terpilih?`)) return;
+        try {
+          await mockRepo.deleteSalesRecords(selectedIds);
           setSelectedIds([]);
-        }
+          alert('Penghapusan transaksi terpilih berhasil.');
+        } catch (e) { alert('Penghapusan gagal: ' + (e?.message || String(e))); }
       };
-
+      const executeDeleteAll = async () => {
+        if (!salesData.length) return alert('Tidak ada data transaksi penjualan untuk dihapus.');
+        if (!confirm(`PERINGATAN! Semua ${salesData.length.toLocaleString('id-ID')} data transaksi penjualan akan dihapus dari Supabase. Tindakan ini tidak dapat dibatalkan. Lanjutkan?`)) return;
+        setDeletingAllSales(true); setDeleteProgress(0); setDeleteStatus('Menyiapkan penghapusan...');
+        try {
+          const result = await mockRepo.deleteSalesRecords(salesData.map(s => s.id), (pct, status) => { setDeleteProgress(pct); setDeleteStatus(status); });
+          setSelectedIds([]);
+          alert(`Selesai. ${result.deleted.toLocaleString('id-ID')} data berhasil dihapus dari Supabase.`);
+        } catch (e) { alert('Penghapusan berhenti: ' + (e?.message || String(e)) + '\nSebagian batch mungkin sudah terhapus.'); }
+        finally { setDeletingAllSales(false); setDeleteStatus(''); }
+      };
       const handleExport = () => {
         if (selectedIds.length === 0) return alert('Pilih data untuk diexport!');
-        const toExport = salesData.filter(s => selectedIds.includes(s.id)).map(r => ({
+        const toExport = salesData.filter(s => selectedIds.some(id => String(id) === String(s.id))).map(r => ({
           'Tanggal': formatDateDMY(r.date), 'Kode item': r.itemCode, 'Nama Barang': r.productName,
           'Penjualan Canvas': r.qtyCanvas, 'Ecer': r.qtyEcer, 'Grosir': r.qtyGrosir, 'MP': r.qtyMP
         }));
         exportToExcel(toExport, 'Transaksi_Penjualan');
       };
-
       return (
         <div className="space-y-6">
           <div className="soft-card p-6">
-            <div className="flex gap-2 mb-6 justify-end items-center">
-              {selectedIds.length > 0 && <button onClick={executeDelete} className="px-3 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold shadow-md">Hapus Massal ({selectedIds.length})</button>}
+            <div className="flex flex-wrap gap-2 mb-5 justify-end items-center">
+              {selectedIds.length > 0 && <button disabled={deletingAllSales} onClick={executeDelete} className="px-3 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold shadow-md">Hapus Massal ({selectedIds.length})</button>}
+              <button disabled={deletingAllSales || salesData.length === 0} onClick={executeDeleteAll} className="px-3 py-2 bg-rose-700 hover:bg-rose-800 text-white rounded-xl text-xs font-bold disabled:opacity-50">{deletingAllSales ? `Menghapus ${deleteProgress}%` : 'Hapus Semua Data'}</button>
               <button onClick={() => exportToExcel([{'Tanggal':'15/01/2026', 'Kode item':'SKU-01', 'Nama Barang':'Produk A', 'Penjualan Canvas':5, 'Ecer':2, 'Grosir':10, 'MP':1}], 'Template_Penjualan')} className="px-3 py-2 bg-slate-100 text-slate-700 rounded-xl text-xs font-semibold">Template</button>
-              <button onClick={() => setImportModal(true)} className="px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold">Import Excel</button>
+              <button disabled={deletingAllSales} onClick={() => setImportModal(true)} className="px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-semibold disabled:opacity-50">Import Excel</button>
               <button onClick={handleExport} className={`px-3 py-2 text-xs font-semibold rounded-xl ${selectedIds.length > 0 ? 'bg-slate-800 text-white' : 'bg-slate-200 text-slate-400'}`}>Export Excel</button>
             </div>
-            
+            {deletingAllSales && <div className="mb-5 rounded-xl border border-rose-100 bg-rose-50 p-4"><div className="flex justify-between text-xs font-bold text-rose-800 mb-2"><span>{deleteStatus}</span><span>{deleteProgress}%</span></div><div className="w-full h-2 bg-rose-100 rounded-full overflow-hidden"><div className="h-full bg-rose-600 transition-all" style={{width: `${deleteProgress}%`}} /></div></div>}
+            <div className="text-xs text-slate-500 mb-3">Total {salesData.length.toLocaleString('id-ID')} transaksi · Menampilkan maksimal 100 baris per halaman.</div>
             <div className="overflow-x-auto rounded-xl border border-slate-100">
               <table className="w-full text-left text-sm whitespace-nowrap">
-                <thead className="bg-slate-50 border-b text-xs font-bold text-slate-500 uppercase">
-                  <tr>
-                    <th className="py-3 px-4 w-12 text-center"><input type="checkbox" checked={salesData.length>0 && selectedIds.length === salesData.length} onChange={handleSelectAll} className="w-4 h-4"/></th>
-                    <th className="py-3 px-4">Tanggal</th>
-                    <th className="py-3 px-4">Kode item</th>
-                    <th className="py-3 px-4">Nama Barang</th>
-                    <th className="py-3 px-4 text-right">Canvas</th>
-                    <th className="py-3 px-4 text-right">Ecer</th>
-                    <th className="py-3 px-4 text-right">Grosir</th>
-                    <th className="py-3 px-4 text-right">MP</th>
-                    <th className="py-3 px-4 text-right font-bold text-blue-600">Total Terjual</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {salesData.map(r => {
-                    const total = Number(r.qtyCanvas) + Number(r.qtyEcer) + Number(r.qtyGrosir) + Number(r.qtyMP);
-                    return (
-                      <tr key={r.id} className="hover:bg-slate-50">
-                        <td className="py-3 px-4 text-center"><input type="checkbox" checked={selectedIds.includes(r.id)} onChange={() => setSelectedIds(prev => prev.includes(r.id) ? prev.filter(c => c !== r.id) : [...prev, r.id])} className="w-4 h-4" /></td>
-                        <td className="py-3 px-4">{formatDateDMY(r.date)}</td>
-                        <td className="py-3 px-4 font-mono font-bold text-slate-700">{r.itemCode}</td>
-                        <td className="py-3 px-4 font-medium">{r.productName}</td>
-                        <td className="py-3 px-4 text-right">{r.qtyCanvas}</td>
-                        <td className="py-3 px-4 text-right">{r.qtyEcer}</td>
-                        <td className="py-3 px-4 text-right">{r.qtyGrosir}</td>
-                        <td className="py-3 px-4 text-right">{r.qtyMP}</td>
-                        <td className="py-3 px-4 text-right font-extrabold text-blue-600">{total}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
+                <thead className="bg-slate-50 border-b text-xs font-bold text-slate-500 uppercase"><tr>
+                  <th className="py-3 px-4 w-12 text-center"><input type="checkbox" checked={pageRows.length > 0 && pageRows.every(s => selectedIds.some(id => String(id) === String(s.id)))} onChange={handleSelectAll} className="w-4 h-4"/></th>
+                  <th className="py-3 px-4">Tanggal</th><th className="py-3 px-4">Kode item</th><th className="py-3 px-4">Nama Barang</th>
+                  <th className="py-3 px-4 text-right">Canvas</th><th className="py-3 px-4 text-right">Ecer</th><th className="py-3 px-4 text-right">Grosir</th><th className="py-3 px-4 text-right">MP</th><th className="py-3 px-4 text-right font-bold text-blue-600">Total Terjual</th>
+                </tr></thead>
+                <tbody className="divide-y divide-slate-100">{pageRows.map(r => {
+                  const total = Number(r.qtyCanvas || 0) + Number(r.qtyEcer || 0) + Number(r.qtyGrosir || 0) + Number(r.qtyMP || 0);
+                  return <tr key={r.id} className="hover:bg-slate-50"><td className="py-3 px-4 text-center"><input type="checkbox" checked={selectedIds.some(id => String(id) === String(r.id))} onChange={() => setSelectedIds(prev => prev.some(id => String(id) === String(r.id)) ? prev.filter(id => String(id) !== String(r.id)) : [...prev, r.id])} className="w-4 h-4"/></td><td className="py-3 px-4">{formatDateDMY(r.date)}</td><td className="py-3 px-4 font-mono font-bold text-slate-700">{r.itemCode}</td><td className="py-3 px-4 font-medium">{r.productName}</td><td className="py-3 px-4 text-right">{r.qtyCanvas}</td><td className="py-3 px-4 text-right">{r.qtyEcer}</td><td className="py-3 px-4 text-right">{r.qtyGrosir}</td><td className="py-3 px-4 text-right">{r.qtyMP}</td><td className="py-3 px-4 text-right font-extrabold text-blue-600">{total}</td></tr>;
+                })}{pageRows.length === 0 && <tr><td colSpan="9" className="py-8 text-center text-slate-400">Belum ada transaksi penjualan.</td></tr>}</tbody>
               </table>
             </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 mt-4"><span className="text-xs text-slate-500">Halaman {salesPage} dari {totalPages}</span><div className="flex gap-2"><button disabled={salesPage <= 1} onClick={() => setSalesPage(p => Math.max(1, p - 1))} className="px-3 py-2 border rounded-lg text-xs font-semibold disabled:opacity-40">Sebelumnya</button><button disabled={salesPage >= totalPages} onClick={() => setSalesPage(p => Math.min(totalPages, p + 1))} className="px-3 py-2 border rounded-lg text-xs font-semibold disabled:opacity-40">Berikutnya</button></div></div>
           </div>
-          {importModal && <ImportExcelModal title="Import Transaksi Penjualan" expectedHeaders={['Tanggal', 'Kode item', 'Nama Barang', 'Penjualan Canvas', 'Ecer', 'Grosir', 'MP']} onClose={() => setImportModal(false)} onImport={async (rows, reportProgress) => {
-            let success = 0; const errors = [];
+          {importModal && <ImportExcelModal title="Import Transaksi Penjualan" expectedHeaders={['Tanggal', 'Kode item', 'Nama Barang']} optionalHeaders={['Penjualan Canvas', 'Ecer', 'Grosir', 'MP']} onClose={() => setImportModal(false)} onImport={async (rows, reportProgress) => {
+            const errors = []; let success = 0; const prepared = [];
+            const products = mockRepo.getProducts();
+            const productMap = new Map();
+            products.forEach(p => { productMap.set(String(p.code || '').trim().toUpperCase(), p); if (p.originalCode) productMap.set(String(p.originalCode).trim().toUpperCase(), p); });
+            // Nilai qty kosong/null/berisi spasi harus disimpan sebagai angka 0.
+            const normalizeSalesQty = (value) => {
+              if (value === null || value === undefined || String(value).trim() === '') return 0;
+              const parsed = Number(value);
+              return Number.isFinite(parsed) ? parsed : 0;
+            };
             for (let i = 0; i < rows.length; i++) {
-              const r = rows[i]; reportProgress?.(Math.round(i / Math.max(rows.length, 1) * 100), `Menyimpan penjualan ${i + 1} dari ${rows.length}...`);
-              try {
-                const itemCode = String(r['Kode item'] || '').trim().toUpperCase();
-                const prod = mockRepo.getProducts().find(p => String(p.code || '').trim().toUpperCase() === itemCode || String(p.originalCode || '').trim().toUpperCase() === itemCode);
-                if (!prod) throw new Error(`Kode Item/Original Code ${itemCode} tidak ditemukan di Master Produk.`);
-                await mockRepo.addSalesRecord({ date: parseDMYtoYMD(r['Tanggal']), itemCode: prod.code, productName: prod.name, qtyCanvas: Number(r['Penjualan Canvas']) || 0, qtyEcer: Number(r['Ecer']) || 0, qtyGrosir: Number(r['Grosir']) || 0, qtyMP: Number(r['MP']) || 0 }); success++;
-              } catch (e) { errors.push(`Baris ${i + 2}: ${e?.message || String(e)}`); }
+              const r = rows[i]; const itemCode = String(r['Kode item'] || '').trim().toUpperCase(); const prod = productMap.get(itemCode);
+              if (!prod) { errors.push(`Baris ${i + 2}: Kode Item/Original Code ${itemCode || '(kosong)'} tidak ditemukan di Master Produk.`); continue; }
+              const date = parseDMYtoYMD(r['Tanggal']);
+              if (!date) { errors.push(`Baris ${i + 2}: Tanggal tidak valid.`); continue; }
+              prepared.push({ rowNumber: i + 2, item: { date, itemCode: prod.code, productName: prod.name, qtyCanvas: normalizeSalesQty(r['Penjualan Canvas']), qtyEcer: normalizeSalesQty(r['Ecer']), qtyGrosir: normalizeSalesQty(r['Grosir']), qtyMP: normalizeSalesQty(r['MP']) } });
+            }
+            const batchSize = 100; const totalBatches = Math.ceil(prepared.length / batchSize);
+            for (let offset = 0; offset < prepared.length; offset += batchSize) {
+              const batch = prepared.slice(offset, offset + batchSize);
+              reportProgress?.(Math.round(offset / Math.max(prepared.length, 1) * 100), `Menyimpan batch ${Math.floor(offset / batchSize) + 1}/${totalBatches} · ${offset + 1}–${Math.min(offset + batch.length, prepared.length)} dari ${prepared.length} data...`);
+              try { const result = await mockRepo.addSalesRecordsBatch(batch.map(x => x.item)); success += result.success; }
+              catch (batchError) {
+                // Jangan retry otomatis setelah kegagalan batch yang ambigu agar tidak berisiko membuat duplikat.
+                // Batch insert Supabase bersifat atomik; batch gagal dilaporkan dan bisa di-import ulang setelah penyebabnya diperbaiki.
+                batch.forEach(entry => errors.push(`Baris ${entry.rowNumber}: batch gagal disimpan (${batchError?.message || String(batchError)}). Silakan periksa lalu import ulang batch ini.`));
+              }
+              reportProgress?.(Math.round(Math.min(offset + batch.length, prepared.length) / Math.max(prepared.length, 1) * 100), `Tersimpan ${Math.min(offset + batch.length, prepared.length)} dari ${prepared.length} data siap import...`);
             }
             reportProgress?.(100, `Selesai: ${success} berhasil, ${errors.length} gagal.`);
-            const message = errors.length
-              ? `Import Transaksi Penjualan selesai.\n\nBerhasil: ${success} data\nGagal: ${errors.length} data\n\nDetail kegagalan: ${errors.slice(0, 3).join(' | ')}`
-              : `Import Transaksi Penjualan berhasil!\n\n${success} transaksi berhasil disimpan.`;
+            const message = errors.length ? `Import Transaksi Penjualan selesai.\n\nBerhasil: ${success} data\nGagal: ${errors.length} data\n\nDetail kegagalan:\n${errors.slice(0, 12).join('\n')}` : `Import Transaksi Penjualan berhasil!\n\n${success} transaksi berhasil disimpan.`;
             return { success, failed: errors.length, closeAfterResult: true, message };
           }} />}
         </div>
@@ -2728,6 +3370,8 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       
       const [selectedIds, setSelectedIds] = React.useState([]);
       const [importModal, setImportModal] = React.useState(false);
+      const [deletingAllPO, setDeletingAllPO] = React.useState(false);
+      const [deleteAllPOProgress, setDeleteAllPOProgress] = React.useState('');
       const [showModal, setShowModal] = React.useState(false);
       const [editItem, setEditItem] = React.useState(null);
       const [formData, setFormData] = React.useState({ returnDate: '', groupCode: '', itemCode: '', productName: '', qtyReturn: 0, returnValue: 0, status: 'OUTSTANDING' });
@@ -3159,84 +3803,158 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       const products = mockRepo.getProducts();
       const poItems = mockRepo.getPOItems();
       const masterStocks = mockRepo.getMasterStocks();
+      const [search, setSearch] = useState('');
+      const [sortMode, setSortMode] = useState('value');
+      const [selectedBrandDetail, setSelectedBrandDetail] = useState(null);
+
+      // Gunakan indeks stok agar pencarian stok per produk tidak berulang.
+      const stockByCode = useMemo(() => new Map(masterStocks.map(s => [String(s.itemCode || '').trim().toUpperCase(), s])), [masterStocks]);
+      const getStockForProduct = (p) => {
+        const st = stockByCode.get(String(p.code || '').trim().toUpperCase());
+        return st ? (Number(st.stokEcer) || 0) + (Number(st.stokGrosir) || 0) + (Number(st.stokGudang) || 0) : 0;
+      };
 
       const reportData = useMemo(() => {
-        return brands.map((b, idx) => {
-          const brandProducts = products.filter(p => p.brandKey === b.code);
-          const skuCount = brandProducts.length;
+        const productsByBrand = new Map();
+        products.forEach(p => {
+          const key = String(p.brandKey || '');
+          if (!productsByBrand.has(key)) productsByBrand.set(key, []);
+          productsByBrand.get(key).push(p);
+        });
+        return brands.map(b => {
+          const brandProducts = productsByBrand.get(String(b.code)) || [];
           let totalStockPcs = 0;
           let totalStockVal = 0;
-
           brandProducts.forEach(p => {
-            const st = masterStocks.find(s => s.itemCode.toUpperCase() === p.code.toUpperCase());
-            const pStockAll = st ? (Number(st.stokEcer) || 0) + (Number(st.stokGrosir) || 0) + (Number(st.stokGudang) || 0) : 0;
-
-            totalStockPcs += pStockAll;
-            const valUnit = getProductUnitValuation(p, poItems);
-            totalStockVal += pStockAll * valUnit;
+            const st = stockByCode.get(String(p.code || '').trim().toUpperCase());
+            const stock = st ? (Number(st.stokEcer) || 0) + (Number(st.stokGrosir) || 0) + (Number(st.stokGudang) || 0) : 0;
+            totalStockPcs += stock;
+            totalStockVal += stock * (Number(getProductUnitValuation(p, poItems)) || 0);
           });
-
-          return {
-            rowNo: idx + 1,
-            brandName: b.name,
-            skuCount,
-            totalStockPcs,
-            totalStockVal
-          };
+          return { brandCode: b.code, brandName: b.name, skuCount: brandProducts.length, totalStockPcs, totalStockVal };
         });
-      }, [brands, products, poItems, masterStocks]);
+      }, [brands, products, poItems, stockByCode]);
+
+      const filteredData = useMemo(() => {
+        const q = search.trim().toLocaleLowerCase('id-ID');
+        const rows = reportData.filter(r => !q || String(r.brandName || '').toLocaleLowerCase('id-ID').includes(q) || String(r.brandCode || '').toLocaleLowerCase('id-ID').includes(q));
+        rows.sort((a, b) => sortMode === 'name'
+          ? String(a.brandName || '').localeCompare(String(b.brandName || ''), 'id', { sensitivity: 'base' })
+          : b.totalStockVal - a.totalStockVal);
+        return rows.map((r, idx) => ({ ...r, rowNo: idx + 1 }));
+      }, [reportData, search, sortMode]);
+
+      const brandDetailProducts = useMemo(() => {
+        if (!selectedBrandDetail) return [];
+        return products
+          .filter(p => String(p.brandKey || '') === String(selectedBrandDetail.brandCode))
+          .map(p => {
+            const stock = getStockForProduct(p);
+            const unitValue = Number(getProductUnitValuation(p, poItems)) || 0;
+            return { productCode: p.code, productName: p.name, totalStock: stock, stockValue: stock * unitValue };
+          })
+          .sort((a, b) => (b.stockValue - a.stockValue) || String(a.productName || '').localeCompare(String(b.productName || ''), 'id', { sensitivity: 'base' }))
+          .map((r, idx) => ({ ...r, rowNo: idx + 1 }));
+      }, [selectedBrandDetail, products, stockByCode, poItems]);
 
       const handleExportExcel = () => {
-        const rows = reportData.map(r => ({
+        const rows = filteredData.map(r => ({
           'No.': r.rowNo,
           'Merek': r.brandName,
           'Jumlah SKU': r.skuCount,
-          'Stok Akhir': r.totalStockPcs,
+          'Stok Akhir (Master Stok)': r.totalStockPcs,
           'Nilai Stok (Rp)': r.totalStockVal
         }));
         exportToExcel(rows, `Laporan_Stok_per_Merek`);
       };
 
-      const handleExportPDF = () => {
-        window.print();
+      const handleExportDetailExcel = () => {
+        if (!selectedBrandDetail) return;
+        exportToExcel(brandDetailProducts.map(r => ({
+          'No.': r.rowNo, 'Kode Item': r.productCode, 'Nama Produk': r.productName,
+          'Total Stok': r.totalStock, 'Nilai Stok (Rp)': r.stockValue
+        })), `Detail_Stok_${selectedBrandDetail.brandName}`);
       };
+
+      const handleExportPDF = () => window.print();
 
       return (
         <div className="space-y-6">
           <div className="soft-card p-6">
-            <div className="flex flex-col sm:flex-row justify-between items-center gap-4 mb-6">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-6">
               <div>
                 <h3 className="font-bold text-slate-800 text-base">Laporan Stok per Merek</h3>
-                <p className="text-xs text-slate-400">Total akumulasi stok dihitung secara real-time dari Stok All (Master Stok)</p>
+                <p className="text-xs text-slate-400">Stok dan valuasi menggunakan Master Stok, sama seperti Dashboard Ringkasan. Klik nama merek untuk melihat detail produk.</p>
               </div>
-
-              <ExportReportButton onExportExcel={handleExportExcel} onExportPDF={handleExportPDF} />
+              {selectedBrandDetail ? (
+                <div className="flex items-center gap-3">
+                  <button onClick={() => setSelectedBrandDetail(null)} className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-xl flex items-center gap-1.5 transition">
+                    <span className="flex shrink-0"><i data-lucide="arrow-left" className="w-3.5 h-3.5"></i></span> Kembali ke Daftar Merek
+                  </button>
+                  <ExportReportButton onExportExcel={handleExportDetailExcel} />
+                </div>
+              ) : <ExportReportButton onExportExcel={handleExportExcel} onExportPDF={handleExportPDF} />}
             </div>
 
-            <div className="overflow-x-auto rounded-xl border border-slate-100">
-              <table className="w-full text-left text-sm">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-100 text-xs font-bold text-slate-500 uppercase">
-                    <th className="py-3 px-4 text-center w-12">No.</th>
-                    <th className="py-3 px-4">Merek</th>
-                    <th className="py-3 px-4 text-right">Jumlah SKU</th>
-                    <th className="py-3 px-4 text-right font-extrabold text-blue-700">Stok Akhir</th>
-                    <th className="py-3 px-4 text-right">Nilai Stok (Rp)</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {reportData.map((r) => (
-                    <tr key={r.rowNo} className="hover:bg-slate-50">
-                      <td className="py-3 px-4 text-center font-bold text-slate-400">{r.rowNo}</td>
-                      <td className="py-3 px-4 font-bold text-slate-800">{r.brandName}</td>
-                      <td className="py-3 px-4 text-right font-medium text-slate-600">{r.skuCount}</td>
-                      <td className="py-3 px-4 text-right font-extrabold text-slate-800">{formatNum(r.totalStockPcs)}</td>
-                      <td className="py-3 px-4 text-right font-bold text-blue-600">{formatRp(r.totalStockVal)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            {selectedBrandDetail ? (
+              <div>
+                <div className="p-3 bg-blue-50 border border-blue-200 rounded-xl mb-4 flex items-center justify-between gap-3">
+                  <div className="text-xs font-semibold text-blue-900">Rincian Stok Merek: <strong className="text-sm font-extrabold">{selectedBrandDetail.brandName}</strong></div>
+                  <span className="text-[11px] text-blue-700 font-medium">{brandDetailProducts.length} produk</span>
+                </div>
+                <div className="overflow-x-auto rounded-xl border border-slate-100">
+                  <table className="w-full text-left text-sm">
+                    <thead><tr className="bg-slate-50 border-b border-slate-100 text-xs font-bold text-slate-500 uppercase">
+                      <th className="py-3 px-4 text-center w-12">No.</th><th className="py-3 px-4">Kode Item</th><th className="py-3 px-4">Nama Produk</th>
+                      <th className="py-3 px-4 text-right font-extrabold text-blue-700">Total Stok</th><th className="py-3 px-4 text-right">Nilai Stok (Rp)</th>
+                    </tr></thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {brandDetailProducts.length === 0 ? <tr><td colSpan="5" className="py-8 text-center text-slate-400">Tidak ada produk untuk merek ini.</td></tr> : brandDetailProducts.map(r => (
+                        <tr key={r.productCode} className="hover:bg-slate-50">
+                          <td className="py-3 px-4 text-center font-bold text-slate-400">{r.rowNo}</td>
+                          <td className="py-3 px-4 font-mono font-bold text-slate-700">{r.productCode}</td>
+                          <td className="py-3 px-4 font-medium text-slate-800">{r.productName}</td>
+                          <td className="py-3 px-4 text-right font-extrabold text-blue-700">{formatNum(r.totalStock)}</td>
+                          <td className="py-3 px-4 text-right font-bold text-slate-800">{formatRp(r.stockValue)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    {brandDetailProducts.length > 0 && <tfoot><tr className="bg-slate-50 border-t-2 border-slate-200 font-extrabold"><td colSpan="3" className="py-3 px-4 text-right">TOTAL</td><td className="py-3 px-4 text-right">{formatNum(brandDetailProducts.reduce((sum, r) => sum + r.totalStock, 0))}</td><td className="py-3 px-4 text-right text-blue-700">{formatRp(brandDetailProducts.reduce((sum, r) => sum + r.stockValue, 0))}</td></tr></tfoot>}
+                  </table>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-col sm:flex-row gap-3 mb-5">
+                  <div className="relative flex-1">
+                    <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Cari nama atau kode merek..." className="w-full rounded-xl border border-slate-200 bg-white py-3 pl-10 pr-4 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100" />
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">⌕</span>
+                  </div>
+                  <select value={sortMode} onChange={e => setSortMode(e.target.value)} className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 outline-none focus:border-blue-400">
+                    <option value="value">Nilai stok tertinggi</option><option value="name">Nama merek A–Z</option>
+                  </select>
+                </div>
+                <div className="text-xs text-slate-400 mb-3">Menampilkan {filteredData.length} dari {reportData.length} merek.</div>
+                <div className="overflow-x-auto rounded-xl border border-slate-100">
+                  <table className="w-full text-left text-sm">
+                    <thead><tr className="bg-slate-50 border-b border-slate-100 text-xs font-bold text-slate-500 uppercase">
+                      <th className="py-3 px-4 text-center w-12">No.</th><th className="py-3 px-4">Nama Merek</th><th className="py-3 px-4 text-right">Jumlah SKU</th>
+                      <th className="py-3 px-4 text-right font-extrabold text-blue-700">Total Stok (Pcs)</th><th className="py-3 px-4 text-right">Nilai Stok (Rp)</th>
+                    </tr></thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {filteredData.map(r => <tr key={r.brandCode} className="hover:bg-blue-50/50">
+                        <td className="py-3 px-4 text-center font-bold text-slate-400">{r.rowNo}</td>
+                        <td className="py-3 px-4"><button onClick={() => setSelectedBrandDetail({ brandCode: r.brandCode, brandName: r.brandName })} className="font-bold text-blue-700 hover:text-blue-900 hover:underline text-left">{r.brandName} <span className="text-xs text-slate-400">↗</span></button></td>
+                        <td className="py-3 px-4 text-right font-medium text-slate-600">{r.skuCount}</td>
+                        <td className="py-3 px-4 text-right font-extrabold text-slate-800">{formatNum(r.totalStockPcs)}</td>
+                        <td className="py-3 px-4 text-right font-bold text-blue-600">{formatRp(r.totalStockVal)}</td>
+                      </tr>)}
+                      {filteredData.length === 0 && <tr><td colSpan="5" className="py-8 text-center text-slate-400">Tidak ada merek yang cocok dengan pencarian.</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
           </div>
         </div>
       );
@@ -3251,8 +3969,10 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       const receipts = mockRepo.getGoodsReceipts();
       const sales = mockRepo.getSales();
       const masterStocks = mockRepo.getMasterStocks();
+      const poItems = mockRepo.getPOItems();
       const [selectedMonth, setSelectedMonth] = useState('2026-01');
       const [selectedBrandDetail, setSelectedBrandDetail] = useState(null);
+      const [brandSortMode, setBrandSortMode] = useState('value');
 
       const [yr, mn] = selectedMonth.split('-');
       const lastDay = new Date(yr, mn, 0).getDate();
@@ -3284,7 +4004,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
 
             const pStockAll = getStockAllForItem(p.code);
             stockAllTotal += pStockAll;
-            inventoryValueTotal += pStockAll * (Number(p.basePrice) || 0);
+            inventoryValueTotal += pStockAll * (Number(getProductUnitValuation(p, poItems)) || 0);
           });
 
           return {
@@ -3296,8 +4016,10 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
             stockAll: stockAllTotal,
             inventoryValue: inventoryValueTotal
           };
-        });
-      }, [brands, products, receipts, sales, masterStocks, selectedMonth]);
+        }).sort((a, b) => brandSortMode === 'name'
+          ? a.brandName.localeCompare(b.brandName, 'id', { sensitivity: 'base' })
+          : b.inventoryValue - a.inventoryValue).map((r, i) => ({ ...r, rowNo: i + 1 }));
+      }, [brands, products, receipts, sales, masterStocks, poItems, selectedMonth, brandSortMode]);
 
       // Data detail produk jika salah satu merek diklik
       const brandDetailProducts = useMemo(() => {
@@ -3311,7 +4033,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
           const pSold = pSales.reduce((s, sl) => s + Number(sl.qty), 0);
 
           const pStockAll = getStockAllForItem(p.code);
-          const pInventoryVal = pStockAll * (Number(p.basePrice) || 0);
+          const pInventoryVal = pStockAll * (Number(getProductUnitValuation(p, poItems)) || 0);
 
           return {
             rowNo: idx + 1,
@@ -3323,7 +4045,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
             inventoryValue: pInventoryVal
           };
         });
-      }, [selectedBrandDetail, products, receipts, sales, masterStocks, selectedMonth]);
+      }, [selectedBrandDetail, products, receipts, sales, masterStocks, poItems, selectedMonth]);
 
       const handleExportMainExcel = () => {
         const rows = reportData.map(r => ({
@@ -3363,6 +4085,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   onChange={e => setSelectedMonth(e.target.value)}
                   className="px-3 py-1.5 border border-slate-200 rounded-xl text-sm font-semibold text-slate-700"
                 />
+                {!selectedBrandDetail && <select value={brandSortMode} onChange={e => setBrandSortMode(e.target.value)} className="px-3 py-1.5 border border-slate-200 rounded-xl text-sm font-semibold text-slate-700"><option value="value">Nilai Tertinggi</option><option value="name">Merek A-Z</option></select>}
               </div>
 
               {selectedBrandDetail ? (
@@ -3575,15 +4298,36 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       const receipts = mockRepo.getGoodsReceipts();
       const products = mockRepo.getProducts();
 
-      const [startDate, setStartDate] = useState('2026-01-01');
-      const [endDate, setEndDate] = useState('2026-12-31');
+      // Default periode: satu bulan kalender penuh sebelumnya.
+      const previousMonthRange = (() => {
+        const now = new Date();
+        const first = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const last = new Date(now.getFullYear(), now.getMonth(), 0);
+        const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        return { start: iso(first), end: iso(last) };
+      })();
+      const [startDate, setStartDate] = useState(previousMonthRange.start);
+      const [endDate, setEndDate] = useState(previousMonthRange.end);
+      const [startDateText, setStartDateText] = useState(previousMonthRange.start.split('-').reverse().join('/'));
+      const [endDateText, setEndDateText] = useState(previousMonthRange.end.split('-').reverse().join('/'));
       const [groupFilter, setGroupFilter] = useState('ALL');
+      const parseDisplayDate = value => {
+        const m = String(value || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+        if (!m) return null;
+        const d = `${m[3]}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+        const dt = new Date(`${d}T00:00:00`);
+        return !Number.isNaN(dt.getTime()) && dt.getFullYear() === Number(m[3]) && dt.getMonth()+1 === Number(m[2]) && dt.getDate() === Number(m[1]) ? d : null;
+      };
+      const updateStartDateText = value => { setStartDateText(value); const parsed = parseDisplayDate(value); if (parsed) setStartDate(parsed); };
+      const updateEndDateText = value => { setEndDateText(value); const parsed = parseDisplayDate(value); if (parsed) setEndDate(parsed); };
 
-      // 1. Saring PO valid berdasarkan rentang tanggal yang dipilih
+      // Samakan sumber status dengan halaman Purchase Order:
+      // keterangan "Tidak datang" muncul bila PO memiliki penerimaan barang,
+      // tetapi item PO tersebut tidak ditemukan pada detail penerimaan untuk PO/grup yang sama.
       const validPOs = useMemo(() => {
         return pos.filter(po => {
-          if (po.status !== 'CLOSED' || po.closeReason !== 'SUPPLIER_SHORTAGE') return false;
-          return isDateInRange(po.orderDate, startDate, endDate);
+          const poDate = po.orderDate || po.date || po.poDate || '';
+          return !poDate || isDateInRange(poDate, startDate, endDate);
         });
       }, [pos, startDate, endDate]);
 
@@ -3608,27 +4352,34 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
         validPOs.forEach(po => {
           if (groupFilter !== 'ALL' && po.groupCode !== groupFilter) return;
 
-          const items = poItems.filter(i => i.poNumber === po.poNumber);
+          const sameGroup = value => !value || !po.groupCode || String(value).trim().toUpperCase() === String(po.groupCode).trim().toUpperCase();
+          const poReceipts = receipts.filter(r =>
+            String(r.poNumber || '').trim() === String(po.poNumber || '').trim() && sameGroup(r.groupCode)
+          );
+          // Halaman Purchase Order menampilkan "Tidak datang" hanya jika sudah ada
+          // penerimaan untuk PO, namun kode item ini tidak ada dalam penerimaan tersebut.
+          if (poReceipts.length === 0) return;
+
+          const items = poItems.filter(i =>
+            String(i.poNumber || '').trim() === String(po.poNumber || '').trim() && sameGroup(i.groupCode)
+          );
 
           items.forEach(it => {
-            const totalReceived = receipts
-              .filter(r => r.poNumber === po.poNumber && r.productCode === it.productCode)
-              .reduce((sum, r) => sum + Number(r.qtyReceived), 0);
+            const exactReceipts = poReceipts.filter(r =>
+              String(r.productCode || '').trim().toUpperCase() === String(it.productCode || '').trim().toUpperCase()
+            );
+            if (exactReceipts.length > 0) return; // status halaman PO = Sudah diterima
 
-            const qtyShortage = Number(it.qtyOrder) - totalReceived;
-
-            if (qtyShortage > 0) {
-              const prd = products.find(p => p.code === it.productCode);
-              rows.push({
-                rowNo: rowIdx++,
-                groupPO: po.groupCode,
-                noPO: po.poNumber,
-                productCode: it.productCode,
-                productName: prd ? prd.name : it.productCode,
-                qtyOrder: Number(it.qtyOrder),
-                qtyUndelivered: qtyShortage
-              });
-            }
+            const prd = products.find(p => String(p.code || '').trim().toUpperCase() === String(it.productCode || '').trim().toUpperCase());
+            rows.push({
+              rowNo: rowIdx++,
+              groupPO: po.groupCode,
+              noPO: po.poNumber,
+              productCode: it.productCode,
+              productName: prd ? prd.name : it.productCode,
+              qtyOrder: Number(it.qtyOrder) || 0,
+              qtyUndelivered: Number(it.qtyOrder) || 0
+            });
           });
         });
 
@@ -3660,17 +4411,19 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-bold text-slate-500 uppercase">Periode PO:</span>
                   <input
-                    type="date"
-                    value={startDate}
-                    onChange={e => setStartDate(e.target.value)}
-                    className="px-2.5 py-1.5 border border-slate-200 rounded-xl text-xs font-semibold focus:ring-2 focus:ring-blue-500"
+                    type="text" inputMode="numeric" placeholder="dd/mm/yyyy"
+                    value={startDateText}
+                    onChange={e => updateStartDateText(e.target.value)}
+                    onBlur={() => { const parsed = parseDisplayDate(startDateText); if (parsed) setStartDateText(parsed.split('-').reverse().join('/')); }}
+                    className="w-28 px-2.5 py-1.5 border border-slate-200 rounded-xl text-xs font-semibold focus:ring-2 focus:ring-blue-500"
                   />
                   <span className="text-xs text-slate-400">s/d</span>
                   <input
-                    type="date"
-                    value={endDate}
-                    onChange={e => setEndDate(e.target.value)}
-                    className="px-2.5 py-1.5 border border-slate-200 rounded-xl text-xs font-semibold focus:ring-2 focus:ring-blue-500"
+                    type="text" inputMode="numeric" placeholder="dd/mm/yyyy"
+                    value={endDateText}
+                    onChange={e => updateEndDateText(e.target.value)}
+                    onBlur={() => { const parsed = parseDisplayDate(endDateText); if (parsed) setEndDateText(parsed.split('-').reverse().join('/')); }}
+                    className="w-28 px-2.5 py-1.5 border border-slate-200 rounded-xl text-xs font-semibold focus:ring-2 focus:ring-blue-500"
                   />
                 </div>
                 <div className="flex items-center gap-2">
@@ -3855,10 +4608,10 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
         return pos
           .filter(p => groupFilter === 'ALL' || p.groupCode === groupFilter)
           .map((po, idx) => {
-            const items = poItems.filter(i => i.poNumber === po.poNumber);
+            const items = poItems.filter(i => i.poNumber === po.poNumber && (!i.groupCode || i.groupCode === po.groupCode));
             const nominalPO = items.reduce((s, it) => s + (Number(it.qtyOrder) * Number(it.unitPrice)), 0);
 
-            const poReceipts = receipts.filter(r => r.poNumber === po.poNumber);
+            const poReceipts = receipts.filter(r => r.poNumber === po.poNumber && (!r.groupCode || r.groupCode === po.groupCode));
             const nilaiDatang = poReceipts.reduce((s, r) => s + (Number(r.qtyReceived) * Number(r.unitCost)), 0);
 
             const selisih = nominalPO - nilaiDatang;
@@ -3973,9 +4726,11 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
       const receipts = mockRepo.getGoodsReceipts();
       const sales = mockRepo.getSales();
       const masterStocks = mockRepo.getMasterStocks();
+      const poItems = mockRepo.getPOItems();
 
       const [startDate, setStartDate] = useState('2026-01-15');
       const [endDate, setEndDate] = useState('2026-01-22');
+      const [brandSortMode, setBrandSortMode] = useState('value');
 
       const getStockAllForItem = (code) => {
         const st = masterStocks.find(s => s.itemCode.toUpperCase() === code.toUpperCase());
@@ -4007,7 +4762,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
 
             const pStockAll = getStockAllForItem(p.code);
             finalStockTotal += pStockAll;
-            inventoryValTotal += pStockAll * (Number(p.basePrice) || 0);
+            inventoryValTotal += pStockAll * (Number(getProductUnitValuation(p, poItems)) || 0);
           });
 
           return {
@@ -4021,10 +4776,12 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
             inventoryValue: inventoryValTotal
           };
         });
-      }, [brands, products, receipts, sales, masterStocks, startDate, endDate]);
+      }, [brands, products, receipts, sales, masterStocks, poItems, startDate, endDate]);
+
+      const sortedReportData = [...reportData].sort((a, b) => brandSortMode === 'name' ? a.brandName.localeCompare(b.brandName, 'id', { sensitivity: 'base' }) : b.inventoryValue - a.inventoryValue).map((r, i) => ({ ...r, rowNo: i + 1 }));
 
       const handleExportExcel = () => {
-        const rows = reportData.map(r => ({
+        const rows = sortedReportData.map(r => ({
           'No.': r.rowNo,
           'Merek': r.brandName,
           'Pembelian (pcs)': r.incoming,
@@ -4057,7 +4814,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   className="px-2.5 py-1.5 border border-slate-200 rounded-xl text-xs font-semibold"
                 />
               </div>
-              <ExportReportButton onExportExcel={handleExportExcel} />
+              <div className="flex items-center gap-3"><select value={brandSortMode} onChange={e => setBrandSortMode(e.target.value)} className="px-3 py-1.5 border border-slate-200 rounded-xl text-xs font-semibold"><option value="value">Nilai Tertinggi</option><option value="name">Merek A-Z</option></select><ExportReportButton onExportExcel={handleExportExcel} /></div>
             </div>
 
             <div className="overflow-x-auto rounded-xl border border-slate-100">
@@ -4075,7 +4832,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {reportData.map((r) => (
+                  {sortedReportData.map((r) => (
                     <tr key={r.rowNo} className="hover:bg-slate-50">
                       <td className="py-3 px-4 text-center font-bold text-slate-400">{r.rowNo}</td>
                       <td className="py-3 px-4 font-bold text-slate-800">{r.brandName}</td>
@@ -4478,7 +5235,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
     // =========================================================================
     // 17. UTILITY: IMPORT EXCEL MODAL DENGAN PREVIEW & VALIDASI BARIS (Prompt 9)
     // =========================================================================
-    function ImportExcelModal({ title, expectedHeaders, onClose, onImport }) {
+    function ImportExcelModal({ title, expectedHeaders, optionalHeaders = [], onClose, onImport }) {
       const [parsedRows, setParsedRows] = useState([]);
       const [validationErrors, setValidationErrors] = useState([]);
       const [fileName, setFileName] = useState('');
@@ -4496,29 +5253,48 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
         const reader = new FileReader();
         reader.onload = (evt) => {
           try {
-            const bstr = evt.target.result;
-            const wb = XLSX.read(bstr, { type: 'binary' });
+            const workbookData = evt.target.result;
+            const wb = XLSX.read(workbookData, { type: 'array', dense: true });
             const wsname = wb.SheetNames[0];
             const ws = wb.Sheets[wsname];
-            const data = XLSX.utils.sheet_to_json(ws);
+            let data = XLSX.utils.sheet_to_json(ws, { defval: '' });
 
             if (data.length === 0) {
               window.alert('File Excel kosong!');
               return;
             }
 
-            // Validasi header
+            // Header dicocokkan tanpa membedakan huruf besar/kecil dan spasi berlebih.
+            const normalizeHeader = value => String(value ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+            const aliases = {
+              'penjualan canvas': ['canvas', 'penjualan canvass', 'penjualan_canvas'],
+              'kode item': ['kode_item', 'kodeitem', 'item code', 'original code'],
+              'nama barang': ['nama produk', 'product name'],
+              'ecer': ['penjualan ecer', 'qty ecer'],
+              'grosir': ['penjualan grosir', 'qty grosir'],
+              'mp': ['penjualan mp', 'marketplace']
+            };
             const fileHeaders = Object.keys(data[0]);
-            const missingHeaders = expectedHeaders.filter(h => !fileHeaders.includes(h));
+            const findHeader = target => fileHeaders.find(h => normalizeHeader(h) === normalizeHeader(target) || (aliases[normalizeHeader(target)] || []).some(a => normalizeHeader(a) === normalizeHeader(h)));
+            const missingHeaders = expectedHeaders.filter(h => !findHeader(h));
             if (missingHeaders.length > 0) {
-              window.alert(`Header tidak valid! Kolom wajib: ${missingHeaders.join(', ')}`);
+              window.alert(`Header tidak valid! Kolom wajib: ${missingHeaders.join(', ')}. Periksa baris pertama file Excel.`);
               return;
             }
+            // Ubah header file menjadi nama standar aplikasi. Kolom kuantitas boleh tidak ada atau kosong; otomatis 0.
+            data = data.map(row => {
+              const normalized = {};
+              [...expectedHeaders, ...optionalHeaders].forEach(field => {
+                const actual = findHeader(field);
+                normalized[field] = actual ? row[actual] : (optionalHeaders.includes(field) ? 0 : row[actual]);
+              });
+              return normalized;
+            });
 
-            // Validasi baris per baris
+            // Validasi nilai hanya untuk kolom wajib; kuantitas kosong dianggap 0.
             const errors = [];
             data.forEach((row, idx) => {
-              const rowNum = idx + 2; // header di row 1
+              const rowNum = idx + 2;
               expectedHeaders.forEach(field => {
                 if (row[field] === undefined || row[field] === null || String(row[field]).trim() === '') {
                   errors.push(`Baris ${rowNum}: Kolom "${field}" tidak boleh kosong.`);
@@ -4532,7 +5308,7 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
             window.alert('Gagal membaca file Excel: ' + err.message);
           }
         };
-        reader.readAsBinaryString(file);
+        reader.readAsArrayBuffer(file);
       };
 
       const handleConfirm = async () => {
@@ -4607,7 +5383,8 @@ Masukkan nama mereknya agar tersimpan ke Master Merek.`, placeholder: 'Contoh: W
                     Ditemukan {validationErrors.length} Kesalahan Validasi:
                   </div>
                   <ul className="list-disc pl-5 max-h-32 overflow-y-auto">
-                    {validationErrors.map((err, idx) => <li key={idx}>{err}</li>)}
+                    {validationErrors.slice(0, 100).map((err, idx) => <li key={idx}>{err}</li>)}
+                    {validationErrors.length > 100 && <li className="font-semibold list-none">Dan {validationErrors.length - 100} kesalahan lainnya tidak ditampilkan.</li>}
                   </ul>
                 </div>
               )}
